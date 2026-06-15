@@ -5,10 +5,10 @@ obj/
 .vscode/
 build/
 cmake-build-*/
+out/
 *.user
 *.suo
 *.rom
 *.prc
 *.pdb
 *.bin
-

@@ -35,3 +35,18 @@ docs/
   trap-map.md      Palm OS trap coverage tracker
 ```
 
+## VB.NET Converter
+
+The first tool lives at `tools/vbnet/PalmEsp32RomTool`.
+
+```text
+dotnet run --project tools/vbnet/PalmEsp32RomTool -- inspect <rom-file>
+dotnet run --project tools/vbnet/PalmEsp32RomTool -- generate <rom-file> <output-dir> --all
+```
+
+The generated ESP32 project currently contains:
+
+- a PlatformIO project skeleton
+- exported installable PRC files from the ROM
+- generated C++ app manifest
+- placeholder runtime entry points for 68K emulation and native Palm trap dispatch
