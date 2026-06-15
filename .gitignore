@@ -1,0 +1,14 @@
+.vs/
+bin/
+obj/
+.pio/
+.vscode/
+build/
+cmake-build-*/
+*.user
+*.suo
+*.rom
+*.prc
+*.pdb
+*.bin
+
