@@ -50,3 +50,5 @@ The generated ESP32 project currently contains:
 - exported installable PRC files from the ROM
 - generated C++ app manifest
 - placeholder runtime entry points for 68K emulation and native Palm trap dispatch
+
+Palm OS 4 smoke-test notes are tracked in `docs/os4-test-results.md`.
