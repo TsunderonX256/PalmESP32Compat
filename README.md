@@ -42,6 +42,8 @@ The first tool lives at `tools/vbnet/PalmEsp32RomTool`.
 ```text
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- inspect <rom-file>
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- generate <rom-file> <output-dir> --all
+dotnet run --project tools/vbnet/PalmEsp32RomTool -- trap-map --markdown
+dotnet run --project tools/vbnet/PalmEsp32RomTool -- snapshot COM4 out/palm-lcd.bmp
 ```
 
 The generated ESP32 project currently contains:
@@ -51,4 +53,10 @@ The generated ESP32 project currently contains:
 - generated C++ app manifest
 - placeholder runtime entry points for 68K emulation and native Palm trap dispatch
 
-Palm OS 4 smoke-test notes are tracked in `docs/os4-test-results.md`.
+The Memo Pad smoke path now includes a native ESP32 Palm API shim for the fake
+Memo database, Palm-like UI drawing, 25% default backlight when the LCD is in
+use, and a `lcdsnap` UART command that the VB.NET `snapshot` command saves as a
+BMP.
+
+Palm OS 4 smoke-test notes are tracked in `docs/os4-test-results.md`, and the
+current selector/API coverage is tracked in `docs/trap-map.md`.

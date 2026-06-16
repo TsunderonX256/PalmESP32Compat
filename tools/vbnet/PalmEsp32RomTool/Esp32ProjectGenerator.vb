@@ -235,7 +235,7 @@ void setup()
 
     printGeneratedPalmApps();
     palmDisplayBacklightOff();
-    Serial.println(""LCD/backlight disabled for runtime trap probes"");
+    Serial.println(""LCD starts off; Memo UI probe enables 25% backlight when it draws"");
 
     if (loadGeneratedPalmApps())
     {
@@ -245,6 +245,7 @@ void setup()
 
 void loop()
 {
+    palmDisplayPollSerialCommands();
     delay(16);
 }
 "
@@ -759,8 +760,16 @@ static constexpr uint32_t kFakeMemoDatabaseId = 0x00020000u;
 static constexpr uint32_t kFakeMemoDatabaseRef = 0x00020010u;
 static constexpr uint32_t kFakeMemoRecordHandle = 0x00020020u;
 static constexpr uint32_t kFakeResourceHandle = 0x00020030u;
-static constexpr uint32_t kFakeMemoRecordPtr = 0x00001080u;
-static constexpr uint32_t kFakeResourcePtr = 0x000010A0u;
+static constexpr uint32_t kFakeAllocationHandle = 0x00020040u;
+static constexpr uint32_t kFakeMemoRecordPtr = 0x00002000u;
+static constexpr uint32_t kFakeResourcePtr = 0x00002100u;
+static constexpr uint32_t kFakeAllocationPtr = 0x00002200u;
+static constexpr uint16_t kFakeMemoRecordCount = 7u;
+static constexpr uint8_t kPalmUiRoleForm = 1u;
+static constexpr uint8_t kPalmUiRoleTitle = 2u;
+static constexpr uint8_t kPalmUiRoleMemoText = 3u;
+static constexpr uint16_t kMemoNewButtonId = 1001u;
+static constexpr uint16_t kMemoDetailsButtonId = 1002u;
 static bool gFakeMemoDatabaseCreated = false;
 static const PalmLoadedApp* gTrapApp = nullptr;
 static const PalmLoadedResource* gLockedResource = nullptr;
@@ -768,9 +777,15 @@ static bool gUseSyntheticStringResource = false;
 static bool gRuntimeUiProbeShown = false;
 static uint32_t gRuntimeUiProbeTrapCount = 0;
 static bool gMemoPadProbeShown = false;
-static char gCapturedUiText[32] = """";
+static char gCapturedTitleText[32] = """";
+static char gCapturedMemoText[32] = """";
+static char gPendingMemoText[32] = """";
+static uint8_t gUiGeometryLogCount = 0;
+static uint8_t gScratchDumpLogCount = 0;
+static uint8_t gDatabaseTraceLogCount = 0;
 
 static bool looksWritablePointer(uint32_t address);
+static void writeCString(uint32_t address, const char* text, uint32_t maxBytes);
 
 void palmTrapSetAppContext(const PalmLoadedApp* app)
 {
@@ -780,7 +795,12 @@ void palmTrapSetAppContext(const PalmLoadedApp* app)
     gRuntimeUiProbeShown = false;
     gRuntimeUiProbeTrapCount = 0;
     gMemoPadProbeShown = false;
-    gCapturedUiText[0] = '\0';
+    gCapturedTitleText[0] = '\0';
+    gCapturedMemoText[0] = '\0';
+    gPendingMemoText[0] = '\0';
+    gUiGeometryLogCount = 0;
+    gScratchDumpLogCount = 0;
+    gDatabaseTraceLogCount = 0;
 }
 
 static PalmTrapResult handledTrap(const PalmTrapFrame& frame, uint32_t d0 = 0, uint32_t a0 = 0)
@@ -883,26 +903,210 @@ static bool readCString(uint32_t address, char* out, uint32_t maxBytes)
     return count > 0;
 }
 
-static void showMemoPadProbe(uint16_t selector, const char* capturedText)
+static const char* fakeMemoText(uint16_t index)
 {
-    ++gRuntimeUiProbeTrapCount;
-    if (capturedText != nullptr && capturedText[0] != '\0')
+    switch (index)
     {
-        strncpy(gCapturedUiText, capturedText, sizeof(gCapturedUiText));
-        gCapturedUiText[sizeof(gCapturedUiText) - 1] = '\0';
+        case 0: return ""Hello from ESP32"";
+        case 1: return ""Second memo row"";
+        case 2: return ""Palm UI drawing"";
+        case 3: return ""Third memo row"";
+        case 4: return ""Note four"";
+        case 5: return ""Note five"";
+        case 6: return ""Note six"";
+        default: return """";
+    }
+}
+
+static void seedFakeMemoRecord(uint16_t index)
+{
+    writeCString(kFakeMemoRecordPtr, fakeMemoText(index), 64u);
+}
+
+static void publishFakeMemoRows(uint16_t selector, uint32_t trapCount)
+{
+    palmDisplayPalmUiSetListCount(selector, trapCount, kFakeMemoRecordCount);
+    for (uint16_t i = 0; i < kFakeMemoRecordCount; ++i)
+    {
+        palmDisplayPalmUiSetListRow(selector, trapCount, i, fakeMemoText(i));
+    }
+}
+
+static void captureMemoProbeText(const char* memoText)
+{
+    if (memoText == nullptr || memoText[0] == '\0')
+    {
+        return;
     }
 
-    if (!gMemoPadProbeShown || (capturedText != nullptr && capturedText[0] != '\0'))
+    strncpy(gPendingMemoText, memoText, sizeof(gPendingMemoText));
+    gPendingMemoText[sizeof(gPendingMemoText) - 1] = '\0';
+}
+
+static bool readInlineStackText(const PalmTrapFrame& frame, char* out, uint32_t maxBytes)
+{
+    if (maxBytes == 0)
+    {
+        return false;
+    }
+
+    uint8_t bytes[16];
+    for (uint32_t i = 0; i < sizeof(bytes); i += 2)
+    {
+        const uint16_t word = stackWord(frame, i);
+        bytes[i] = static_cast<uint8_t>((word >> 8) & 0xffu);
+        bytes[i + 1u] = static_cast<uint8_t>(word & 0xffu);
+    }
+
+    uint32_t bestStart = 0;
+    uint32_t bestLen = 0;
+    uint32_t runStart = 0;
+    uint32_t runLen = 0;
+    for (uint32_t i = 0; i < sizeof(bytes); ++i)
+    {
+        const bool printable = bytes[i] >= 32 && bytes[i] <= 126;
+        if (printable)
+        {
+            if (runLen == 0)
+            {
+                runStart = i;
+            }
+            ++runLen;
+            if (runLen > bestLen)
+            {
+                bestStart = runStart;
+                bestLen = runLen;
+            }
+        }
+        else
+        {
+            runLen = 0;
+        }
+    }
+
+    if (bestLen < 3)
+    {
+        out[0] = '\0';
+        return false;
+    }
+
+    const uint32_t copyLen = bestLen + 1u < maxBytes ? bestLen : maxBytes - 1u;
+    for (uint32_t i = 0; i < copyLen; ++i)
+    {
+        out[i] = static_cast<char>(bytes[bestStart + i]);
+    }
+    out[copyLen] = '\0';
+    return true;
+}
+
+static bool readCandidateTextFromFrame(const PalmTrapFrame& frame, char* out, uint32_t maxBytes)
+{
+    if (maxBytes == 0)
+    {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < 8; ++i)
+    {
+        const uint32_t value = frame.stackLongs[i];
+        if (readCString(value, out, maxBytes))
+        {
+            return true;
+        }
+        if (readCString(value >> 16, out, maxBytes))
+        {
+            return true;
+        }
+        if (readCString(value & 0xffffu, out, maxBytes))
+        {
+            return true;
+        }
+    }
+
+    out[0] = '\0';
+    return false;
+}
+
+static bool isScratchPointer(uint32_t address)
+{
+    return address >= 0x00001000u && address < 0x00001100u;
+}
+
+static bool isMemoRowDrawFrame(const PalmTrapFrame& frame)
+{
+    if (frame.selector != 0xA11D || gPendingMemoText[0] == '\0')
+    {
+        return false;
+    }
+
+    const uint32_t rowStateP = frame.stackLongs[0];
+    const uint32_t packedMeta = frame.stackLongs[2];
+    const uint32_t rowMetaP = (packedMeta >> 16) & 0xffffu;
+    return isScratchPointer(rowStateP) &&
+        frame.stackLongs[1] == 0xffffffffu &&
+        isScratchPointer(rowMetaP) &&
+        rowMetaP >= rowStateP;
+}
+
+static void showMemoPadProbe(uint16_t selector, const char* capturedTitle, const char* capturedMemo)
+{
+    ++gRuntimeUiProbeTrapCount;
+    if (!gMemoPadProbeShown)
     {
         gMemoPadProbeShown = true;
         gRuntimeUiProbeShown = true;
-        palmDisplayShowMemoPadProbe(selector, gRuntimeUiProbeTrapCount, gCapturedUiText);
+        palmDisplayPalmUiBeginForm(selector, gRuntimeUiProbeTrapCount,
+            capturedTitle != nullptr && capturedTitle[0] != '\0' ? capturedTitle : ""Memo Pad"");
+        palmDisplayPalmUiSetCategory(selector, gRuntimeUiProbeTrapCount, ""All"");
+        palmDisplayPalmUiDrawButton(selector, gRuntimeUiProbeTrapCount, kMemoNewButtonId, ""New"");
+        palmDisplayPalmUiDrawButton(selector, gRuntimeUiProbeTrapCount, kMemoDetailsButtonId, ""Details"");
     }
+
+    if (capturedTitle != nullptr && capturedTitle[0] != '\0' && strcmp(capturedTitle, gCapturedTitleText) != 0)
+    {
+        strncpy(gCapturedTitleText, capturedTitle, sizeof(gCapturedTitleText));
+        gCapturedTitleText[sizeof(gCapturedTitleText) - 1] = '\0';
+        palmDisplayPalmUiDrawText(selector, gRuntimeUiProbeTrapCount, 9, 8, gCapturedTitleText);
+    }
+    if (capturedMemo != nullptr && capturedMemo[0] != '\0' && strcmp(capturedMemo, gCapturedMemoText) != 0)
+    {
+        strncpy(gCapturedMemoText, capturedMemo, sizeof(gCapturedMemoText));
+        gCapturedMemoText[sizeof(gCapturedMemoText) - 1] = '\0';
+        palmDisplayPalmUiDrawText(selector, gRuntimeUiProbeTrapCount, 12, 29, gCapturedMemoText);
+    }
+}
+
+static void logUiGeometryProbe(const PalmTrapFrame& frame)
+{
+    if (gUiGeometryLogCount >= 12)
+    {
+        return;
+    }
+
+    ++gUiGeometryLogCount;
+    Serial.printf(""  UI geometry selector=0x%04X words=[%u,%u,%u,%u,%u,%u,%u,%u] signed=[%d,%d,%d,%d] ptrs=0x%04X,0x%04X,0x%04X\n"",
+        static_cast<unsigned>(frame.selector),
+        static_cast<unsigned>(stackWord(frame, 0)),
+        static_cast<unsigned>(stackWord(frame, 2)),
+        static_cast<unsigned>(stackWord(frame, 4)),
+        static_cast<unsigned>(stackWord(frame, 6)),
+        static_cast<unsigned>(stackWord(frame, 8)),
+        static_cast<unsigned>(stackWord(frame, 10)),
+        static_cast<unsigned>(stackWord(frame, 12)),
+        static_cast<unsigned>(stackWord(frame, 14)),
+        static_cast<int16_t>(stackWord(frame, 0)),
+        static_cast<int16_t>(stackWord(frame, 2)),
+        static_cast<int16_t>(stackWord(frame, 4)),
+        static_cast<int16_t>(stackWord(frame, 6)),
+        static_cast<unsigned>(frame.stackLongs[0] & 0xffffu),
+        static_cast<unsigned>((frame.stackLongs[1] >> 16) & 0xffffu),
+        static_cast<unsigned>(frame.stackLongs[1] & 0xffffu));
 }
 
 static bool looksWritablePointer(uint32_t address)
 {
-    return address >= 0x00001000u && address < 0x00001100u;
+    return (address >= 0x00001000u && address < 0x00001100u) ||
+        (address >= 0x00002000u && address < 0x00002400u);
 }
 
 static void writeCString(uint32_t address, const char* text, uint32_t maxBytes)
@@ -922,6 +1126,23 @@ static void writeCString(uint32_t address, const char* text, uint32_t maxBytes)
     m68k_write_memory_8(address + i, 0);
 }
 
+static void zeroMemory(uint32_t address, uint32_t byteCount)
+{
+    if (!looksWritablePointer(address))
+    {
+        return;
+    }
+
+    for (uint32_t i = 0; i < byteCount; ++i)
+    {
+        if (!looksWritablePointer(address + i))
+        {
+            break;
+        }
+        m68k_write_memory_8(address + i, 0);
+    }
+}
+
 static void writeWordIfPointer(uint32_t address, uint16_t value)
 {
     if (looksWritablePointer(address))
@@ -938,46 +1159,112 @@ static void writeLongIfPointer(uint32_t address, uint32_t value)
     }
 }
 
+static void logScratchBytes(const char* label)
+{
+    if (gScratchDumpLogCount >= 8)
+    {
+        return;
+    }
+
+    ++gScratchDumpLogCount;
+    Serial.printf(""  scratch %s 0x1070:"", label);
+    for (uint32_t i = 0; i < 32; ++i)
+    {
+        Serial.printf("" %02X"", static_cast<unsigned>(m68k_read_memory_8(0x00001070u + i) & 0xffu));
+    }
+    Serial.printf("" | words: 1076=%04X 1086=%04X 108A=%04X 108C=%04X\n"",
+        static_cast<unsigned>(m68k_read_memory_16(0x00001076u) & 0xffffu),
+        static_cast<unsigned>(m68k_read_memory_16(0x00001086u) & 0xffffu),
+        static_cast<unsigned>(m68k_read_memory_16(0x0000108Au) & 0xffffu),
+        static_cast<unsigned>(m68k_read_memory_16(0x0000108Cu) & 0xffffu));
+}
+
+static void logDatabaseTrapWords(const PalmTrapFrame& frame)
+{
+    if (gDatabaseTraceLogCount >= 8)
+    {
+        return;
+    }
+
+    ++gDatabaseTraceLogCount;
+    Serial.printf(""  DB words selector=0x%04X words=[%04X,%04X,%04X,%04X,%04X,%04X,%04X,%04X] longs=[0x%08X,0x%08X,0x%08X,0x%08X]\n"",
+        static_cast<unsigned>(frame.selector),
+        static_cast<unsigned>(stackWord(frame, 0)),
+        static_cast<unsigned>(stackWord(frame, 2)),
+        static_cast<unsigned>(stackWord(frame, 4)),
+        static_cast<unsigned>(stackWord(frame, 6)),
+        static_cast<unsigned>(stackWord(frame, 8)),
+        static_cast<unsigned>(stackWord(frame, 10)),
+        static_cast<unsigned>(stackWord(frame, 12)),
+        static_cast<unsigned>(stackWord(frame, 14)),
+        static_cast<unsigned>(frame.stackLongs[0]),
+        static_cast<unsigned>(frame.stackLongs[1]),
+        static_cast<unsigned>(frame.stackLongs[2]),
+        static_cast<unsigned>(frame.stackLongs[3]));
+
+    for (uint32_t i = 0; i < 4; ++i)
+    {
+        const uint32_t candidate = frame.stackLongs[i];
+        if (!isScratchPointer(candidate) && !isScratchPointer(candidate >> 16) && !isScratchPointer(candidate & 0xffffu))
+        {
+            continue;
+        }
+
+        Serial.printf(""    ptr candidates[%u]=0x%08X hi=0x%04X lo=0x%04X\n"",
+            static_cast<unsigned>(i),
+            static_cast<unsigned>(candidate),
+            static_cast<unsigned>((candidate >> 16) & 0xffffu),
+            static_cast<unsigned>(candidate & 0xffffu));
+    }
+}
+
 const char* palmTrapName(uint16_t selector)
 {
     switch (selector)
     {
-        case 0xA012: return ""MemPtrFree"";
+        case 0xA012: return ""MemChunkFree"";
         case 0xA013: return ""MemPtrNew"";
+        case 0xA01E: return ""MemHandleNew"";
         case 0xA07F: return ""DmCreateDatabaseFromImage"";
         case 0xA041: return ""DmCreateDatabase"";
-        case 0xA042: return ""SelectorA042"";
-        case 0xA04A: return ""SelectorA04A"";
-        case 0xA04C: return ""SelectorA04C"";
+        case 0xA042: return ""DmDeleteDatabase"";
+        case 0xA04A: return ""DmCloseDatabase"";
+        case 0xA049: return ""DmOpenDatabase"";
+        case 0xA04C: return ""DmOpenDatabaseInfo"";
         case 0xA046: return ""SelectorA046"";
         case 0xA047: return ""SelectorA047"";
-        case 0xA059: return ""SelectorA059"";
-        case 0xA05B: return ""UIProbeA05B"";
+        case 0xA04F: return ""DmNumRecords"";
+        case 0xA050: return ""DmRecordInfo"";
+        case 0xA059: return ""DmNewHandle"";
+        case 0xA05B: return ""DmQueryRecord"";
+        case 0xA05C: return ""DmGetRecord"";
+        case 0xA05E: return ""DmReleaseRecord"";
         case 0xA05F: return ""SelectorA05F"";
-        case 0xA020: return ""MemHandleLock"";
-        case 0xA021: return ""MemHandleUnlock"";
-        case 0xA022: return ""MemHandleFree"";
+        case 0xA020: return ""MemHandleToLocalID"";
+        case 0xA021: return ""MemHandleLock"";
+        case 0xA022: return ""MemHandleUnlock"";
+        case 0xA02B: return ""MemHandleFree"";
         case 0xA035: return ""SelectorA035"";
         case 0xA036: return ""SelectorA036"";
-        case 0xA071: return ""UIProbeA071"";
-        case 0xA075: return ""DmFindDatabaseByTypeCreator"";
-        case 0xA07E: return ""SelectorA07E"";
-        case 0xA061: return ""SelectorA061"";
-        case 0xA084: return ""SelectorA084"";
+        case 0xA071: return ""DmNumRecordsInCategory"";
+        case 0xA075: return ""DmOpenDatabaseByTypeCreator"";
+        case 0xA07E: return ""DmSet"";
+        case 0xA061: return ""DmReleaseResource"";
+        case 0xA084: return ""ErrDisplayFileLineMsg"";
         case 0xA08F: return ""SysAppStartup"";
         case 0xA090: return ""SysAppExit"";
-        case 0xA0A9: return ""UIProbeTextOrDrawA0A9"";
-        case 0xA104: return ""UIProbeFormA104"";
-        case 0xA11D: return ""UIProbeStringA11D"";
-        case 0xA19B: return ""UIProbeA19B"";
-        case 0xA1A0: return ""UIProbeA1A0"";
-        case 0xA1BF: return ""UIProbeA1BF"";
+        case 0xA0A9: return ""SysHandleEvent"";
+        case 0xA104: return ""CategoryGetName"";
+        case 0xA11D: return ""EvtGetEvent"";
+        case 0xA19B: return ""FrmGotoForm"";
+        case 0xA1A0: return ""FrmDispatchEvent"";
+        case 0xA1BF: return ""MenuHandleEvent"";
         case 0xA2D3: return ""PrefGetAppPreferences"";
-        case 0xA2FC: return ""SelectorA2FC"";
+        case 0xA2FC: return ""CategoryInitialize"";
         case 0xA12F: return ""EvtWakeup"";
         case 0xA27B: return ""FtrGet"";
         case 0xA3AB: return ""UIBrightnessAdjust"";
-        case 0xA3FF: return ""SelectorA3FF"";
+        case 0xA3FF: return ""ExgRegisterDatatype"";
         case 0xA9F0: return ""SysAppLaunch-or-launch-dispatch"";
         default: return ""unknown"";
     }
@@ -1019,18 +1306,18 @@ PalmTrapResult palmDispatchTrap(const PalmTrapFrame& frame)
                 palmTrapName(frame.selector),
                 static_cast<unsigned>(frame.stackLongs[0]),
                 static_cast<unsigned>(frame.stackLongs[1]));
-            return handledTrap(frame, 0, kFakeMemoDatabaseRef);
+            return handledTrap(frame, kFakeMemoDatabaseRef, kFakeMemoDatabaseRef);
 
         case 0xA059:
-            Serial.printf(""  trap dispatch: selector=0x%04X name=%s dbRef=0x%08X arg1=0x%08X arg2=0x%08X -> handle=0x%08X\n"",
+            Serial.printf(""  trap dispatch: selector=0x%04X name=%s dbRef=0x%08X sizeOrArg=0x%08X arg2=0x%08X -> handle=0x%08X\n"",
                 static_cast<unsigned>(frame.selector),
                 palmTrapName(frame.selector),
                 static_cast<unsigned>(frame.stackLongs[0]),
                 static_cast<unsigned>(frame.stackLongs[1]),
                 static_cast<unsigned>(frame.stackLongs[2]),
-                static_cast<unsigned>(kFakeMemoRecordHandle));
-            writeCString(kFakeMemoRecordPtr, """", 16u);
-            return handledTrap(frame, 0, kFakeMemoRecordHandle);
+                static_cast<unsigned>(kFakeAllocationHandle));
+            zeroMemory(kFakeAllocationPtr, 256u);
+            return handledTrap(frame, kFakeAllocationHandle, kFakeAllocationHandle);
 
         case 0xA05F:
         {
@@ -1048,13 +1335,35 @@ PalmTrapResult palmDispatchTrap(const PalmTrapFrame& frame)
                 gLockedResource != nullptr ? ""yes"" : ""no"",
                 gUseSyntheticStringResource ? ""yes"" : ""no"",
                 static_cast<unsigned>(kFakeResourceHandle));
-            return handledTrap(frame, 0, (gLockedResource != nullptr || gUseSyntheticStringResource) ? kFakeResourceHandle : 0u);
+            {
+                const uint32_t handle = (gLockedResource != nullptr || gUseSyntheticStringResource) ? kFakeResourceHandle : 0u;
+                return handledTrap(frame, handle, handle);
+            }
         }
 
         case 0xA020:
         {
             const uint32_t handle = frame.stackLongs[0];
-            const uint32_t ptr = handle == kFakeResourceHandle ? kFakeResourcePtr : kFakeMemoRecordPtr;
+            Serial.printf(""  trap dispatch: selector=0x%04X name=%s handle=0x%08X -> localID=0x%08X\n"",
+                static_cast<unsigned>(frame.selector),
+                palmTrapName(frame.selector),
+                static_cast<unsigned>(handle),
+                static_cast<unsigned>(handle));
+            return handledTrap(frame, handle, handle);
+        }
+
+        case 0xA021:
+        {
+            const uint32_t handle = frame.stackLongs[0];
+            uint32_t ptr = kFakeMemoRecordPtr;
+            if (handle == kFakeResourceHandle)
+            {
+                ptr = kFakeResourcePtr;
+            }
+            else if (handle == kFakeAllocationHandle)
+            {
+                ptr = kFakeAllocationPtr;
+            }
             if (handle == kFakeResourceHandle && gLockedResource != nullptr)
             {
                 copyResourceToMemory(*gLockedResource, kFakeResourcePtr);
@@ -1068,11 +1377,77 @@ PalmTrapResult palmDispatchTrap(const PalmTrapFrame& frame)
                 palmTrapName(frame.selector),
                 static_cast<unsigned>(handle),
                 static_cast<unsigned>(ptr));
-            return handledTrap(frame, 0, ptr);
+            return handledTrap(frame, ptr, ptr);
         }
 
-        case 0xA021:
+        case 0xA04F:
+            Serial.printf(""  trap dispatch: selector=0x%04X name=%s dbRef=0x%08X -> records=%u\n"",
+                static_cast<unsigned>(frame.selector),
+                palmTrapName(frame.selector),
+                static_cast<unsigned>(frame.stackLongs[0]),
+                static_cast<unsigned>(kFakeMemoRecordCount));
+            return handledTrap(frame, kFakeMemoRecordCount, 0);
+
+        case 0xA050:
+        {
+            const uint32_t dbRef = frame.stackLongs[0];
+            const uint16_t index = stackWord(frame, 4);
+            const uint32_t attrP = stackLong(frame, 6);
+            const uint32_t uniqueIDP = stackLong(frame, 10);
+            const uint32_t chunkIDP = stackLong(frame, 14);
+            const uint16_t safeIndex = index < kFakeMemoRecordCount ? index : 0;
+            writeWordIfPointer(attrP, 0);
+            writeLongIfPointer(uniqueIDP, static_cast<uint32_t>(safeIndex) + 1u);
+            writeLongIfPointer(chunkIDP, kFakeMemoRecordHandle);
+            captureMemoProbeText(fakeMemoText(safeIndex));
+            Serial.printf(""  trap dispatch: selector=0x%04X name=%s dbRef=0x%08X index=%u attrP=0x%08X uniqueP=0x%08X chunkP=0x%08X rawWords=[%04X,%04X,%04X,%04X,%04X,%04X,%04X,%04X] probeMemo='%s' -> ok\n"",
+                static_cast<unsigned>(frame.selector),
+                palmTrapName(frame.selector),
+                static_cast<unsigned>(dbRef),
+                static_cast<unsigned>(index),
+                static_cast<unsigned>(attrP),
+                static_cast<unsigned>(uniqueIDP),
+                static_cast<unsigned>(chunkIDP),
+                static_cast<unsigned>(stackWord(frame, 0)),
+                static_cast<unsigned>(stackWord(frame, 2)),
+                static_cast<unsigned>(stackWord(frame, 4)),
+                static_cast<unsigned>(stackWord(frame, 6)),
+                static_cast<unsigned>(stackWord(frame, 8)),
+                static_cast<unsigned>(stackWord(frame, 10)),
+                static_cast<unsigned>(stackWord(frame, 12)),
+                static_cast<unsigned>(stackWord(frame, 14)),
+                fakeMemoText(safeIndex));
+            logScratchBytes(""after A050"");
+            return handledTrap(frame, 0, 0);
+        }
+
+        case 0xA05B:
+        case 0xA05C:
+        {
+            const uint32_t dbRef = frame.stackLongs[0];
+            const uint16_t index = stackWord(frame, 4);
+            const uint16_t safeIndex = index < kFakeMemoRecordCount ? index : 0;
+            seedFakeMemoRecord(safeIndex);
+            Serial.printf(""  trap dispatch: selector=0x%04X name=%s dbRef=0x%08X index=%u -> handle=0x%08X\n"",
+                static_cast<unsigned>(frame.selector),
+                palmTrapName(frame.selector),
+                static_cast<unsigned>(dbRef),
+                static_cast<unsigned>(safeIndex),
+                static_cast<unsigned>(kFakeMemoRecordHandle));
+            return handledTrap(frame, kFakeMemoRecordHandle, kFakeMemoRecordHandle);
+        }
+
+        case 0xA05E:
+            Serial.printf(""  trap dispatch: selector=0x%04X name=%s dbRef=0x%08X indexOrHandle=0x%08X dirty=0x%08X\n"",
+                static_cast<unsigned>(frame.selector),
+                palmTrapName(frame.selector),
+                static_cast<unsigned>(frame.stackLongs[0]),
+                static_cast<unsigned>(frame.stackLongs[1]),
+                static_cast<unsigned>(frame.stackLongs[2]));
+            return handledTrap(frame, 0, 0);
+
         case 0xA022:
+        case 0xA02B:
             Serial.printf(""  trap dispatch: selector=0x%04X name=%s handle=0x%08X\n"",
                 static_cast<unsigned>(frame.selector),
                 palmTrapName(frame.selector),
@@ -1095,6 +1470,7 @@ PalmTrapResult palmDispatchTrap(const PalmTrapFrame& frame)
                 static_cast<unsigned>(frame.stackLongs[1]),
                 static_cast<unsigned>(frame.stackLongs[2]),
                 static_cast<unsigned>(frame.stackLongs[3]));
+            logDatabaseTrapWords(frame);
             return handledTrap(frame, 0, 0);
 
         case 0xA07E:
@@ -1106,7 +1482,7 @@ PalmTrapResult palmDispatchTrap(const PalmTrapFrame& frame)
                 static_cast<unsigned>(frame.stackLongs[2]),
                 static_cast<unsigned>(kFakeResourceHandle));
             writeCString(kFakeResourcePtr, ""Memo"", 16u);
-            return handledTrap(frame, 0, kFakeResourceHandle);
+            return handledTrap(frame, kFakeResourceHandle, kFakeResourceHandle);
 
         case 0xA2FC:
         case 0xA3FF:
@@ -1120,28 +1496,105 @@ PalmTrapResult palmDispatchTrap(const PalmTrapFrame& frame)
             return handledTrap(frame, 0, 0);
 
         case 0xA104:
-        case 0xA05B:
-        case 0xA071:
+        {
+            const uint32_t dbRef = frame.stackLongs[0];
+            const uint16_t categoryIndex = stackWord(frame, 4);
+            const uint32_t nameP = stackLong(frame, 6);
+            writeCString(nameP, categoryIndex == 0 ? ""All"" : ""Unfiled"", 16u);
+            showMemoPadProbe(frame.selector, ""Memo Pad"", """");
+            palmDisplayPalmUiSetCategory(frame.selector, gRuntimeUiProbeTrapCount, categoryIndex == 0 ? ""All"" : ""Unfiled"");
+            Serial.printf(""  trap dispatch: selector=0x%04X name=%s dbRef=0x%08X category=%u nameP=0x%08X -> '%s'\n"",
+                static_cast<unsigned>(frame.selector),
+                palmTrapName(frame.selector),
+                static_cast<unsigned>(dbRef),
+                static_cast<unsigned>(categoryIndex),
+                static_cast<unsigned>(nameP),
+                categoryIndex == 0 ? ""All"" : ""Unfiled"");
+            return handledTrap(frame, 0, 0);
+        }
+
         case 0xA19B:
-        case 0xA11D:
         case 0xA0A9:
         case 0xA1BF:
         case 0xA1A0:
         {
-            char capturedText[32];
-            capturedText[0] = '\0';
-            if (frame.selector == 0xA11D)
+            char capturedTitle[32];
+            char capturedMemo[32];
+            capturedTitle[0] = '\0';
+            capturedMemo[0] = '\0';
+            if (frame.selector == 0xA19B)
             {
-                readCString(frame.stackLongs[0], capturedText, sizeof(capturedText));
+                readCandidateTextFromFrame(frame, capturedTitle, sizeof(capturedTitle));
+                if (capturedTitle[0] == '\0')
+                {
+                    readInlineStackText(frame, capturedTitle, sizeof(capturedTitle));
+                }
             }
-            showMemoPadProbe(frame.selector, capturedText);
-            Serial.printf(""  trap dispatch: UI probe selector=0x%04X name=%s stack[0..2]=0x%08X,0x%08X,0x%08X\n"",
+            else if (frame.selector == 0xA11D)
+            {
+                readCString(frame.stackLongs[0], capturedMemo, sizeof(capturedMemo));
+                if (capturedMemo[0] == '\0' && isMemoRowDrawFrame(frame))
+                {
+                    strncpy(capturedMemo, gPendingMemoText, sizeof(capturedMemo));
+                    capturedMemo[sizeof(capturedMemo) - 1] = '\0';
+                }
+            }
+            if (frame.selector != 0xA19B && capturedMemo[0] == '\0')
+            {
+                readCandidateTextFromFrame(frame, capturedMemo, sizeof(capturedMemo));
+            }
+            showMemoPadProbe(frame.selector, capturedTitle, capturedMemo);
+            if (frame.selector == 0xA11D || frame.selector == 0xA0A9 || frame.selector == 0xA1BF || frame.selector == 0xA1A0)
+            {
+                logUiGeometryProbe(frame);
+                if (frame.selector == 0xA11D)
+                {
+                    logScratchBytes(""at A11D"");
+                }
+            }
+            Serial.printf(""  trap dispatch: UI probe selector=0x%04X name=%s title='%s' memo='%s' stack[0..2]=0x%08X,0x%08X,0x%08X\n"",
                 static_cast<unsigned>(frame.selector),
                 palmTrapName(frame.selector),
+                capturedTitle,
+                capturedMemo,
                 static_cast<unsigned>(frame.stackLongs[0]),
                 static_cast<unsigned>(frame.stackLongs[1]),
                 static_cast<unsigned>(frame.stackLongs[2]));
             return handledTrap(frame, 0, 0);
+        }
+
+        case 0xA11D:
+        {
+            const uint32_t eventP = frame.stackLongs[0];
+            const uint32_t timeout = frame.stackLongs[1];
+            zeroMemory(eventP, 24u);
+            showMemoPadProbe(frame.selector, """", gPendingMemoText);
+            if (gPendingMemoText[0] != '\0')
+            {
+                palmDisplayPalmUiDrawText(frame.selector, gRuntimeUiProbeTrapCount, 12, 29, gPendingMemoText);
+            }
+            logUiGeometryProbe(frame);
+            logScratchBytes(""at EvtGetEvent"");
+            Serial.printf(""  trap dispatch: selector=0x%04X name=%s eventP=0x%08X timeout=0x%08X -> nilEvent\n"",
+                static_cast<unsigned>(frame.selector),
+                palmTrapName(frame.selector),
+                static_cast<unsigned>(eventP),
+                static_cast<unsigned>(timeout));
+            return handledTrap(frame, 0, 0);
+        }
+
+        case 0xA071:
+        {
+            const uint32_t dbRef = frame.stackLongs[0];
+            const uint16_t category = stackWord(frame, 4);
+            publishFakeMemoRows(frame.selector, gRuntimeUiProbeTrapCount);
+            Serial.printf(""  trap dispatch: selector=0x%04X name=%s dbRef=0x%08X category=%u -> records=%u\n"",
+                static_cast<unsigned>(frame.selector),
+                palmTrapName(frame.selector),
+                static_cast<unsigned>(dbRef),
+                static_cast<unsigned>(category),
+                static_cast<unsigned>(kFakeMemoRecordCount));
+            return handledTrap(frame, kFakeMemoRecordCount, 0);
         }
 
         case 0xA2D3:
@@ -1221,28 +1674,45 @@ PalmTrapResult palmDispatchTrap(const PalmTrapFrame& frame)
                 static_cast<unsigned>(frame.stackLongs[0]));
             return handledTrap(frame, 0, 0);
 
-        case 0xA04C:
+        case 0xA049:
         {
-            const uint32_t dbID = stackLong(frame, 0);
-            const uint32_t nameP = stackLong(frame, 4);
-            const uint32_t attributesP = stackLong(frame, 8);
-            const uint32_t versionP = stackLong(frame, 12);
-            const uint32_t crDateP = stackLong(frame, 16);
-            const uint32_t modDateP = stackLong(frame, 20);
-            Serial.printf(""  trap dispatch: selector=0x%04X name=%s db=0x%08X nameP=0x%08X attrP=0x%08X verP=0x%08X dates=0x%08X,0x%08X\n"",
+            const uint32_t dbID = frame.stackLongs[0];
+            const uint16_t mode = stackWord(frame, 4);
+            const uint32_t openedRef = 0u;
+            Serial.printf(""  trap dispatch: selector=0x%04X name=%s db=0x%08X mode=0x%04X -> ref=0x%08X (force create path)\n"",
                 static_cast<unsigned>(frame.selector),
                 palmTrapName(frame.selector),
                 static_cast<unsigned>(dbID),
-                static_cast<unsigned>(nameP),
-                static_cast<unsigned>(attributesP),
-                static_cast<unsigned>(versionP),
-                static_cast<unsigned>(crDateP),
-                static_cast<unsigned>(modDateP));
-            writeCString(nameP, ""MemoDB"", 32u);
-            writeWordIfPointer(attributesP, 0);
-            writeWordIfPointer(versionP, 1);
-            writeLongIfPointer(crDateP, 0);
-            writeLongIfPointer(modDateP, 0);
+                static_cast<unsigned>(mode),
+                static_cast<unsigned>(openedRef));
+            return handledTrap(frame, openedRef, openedRef);
+        }
+
+        case 0xA04C:
+        {
+            const uint32_t dbRef = frame.stackLongs[0];
+            const uint32_t dbIDP = stackLong(frame, 4);
+            const uint32_t openCountP = stackLong(frame, 8);
+            const uint32_t modeP = stackLong(frame, 12);
+            const uint32_t cardNoP = stackLong(frame, 16);
+            const uint32_t resDBP = stackLong(frame, 20);
+            writeLongIfPointer(dbIDP, kFakeMemoDatabaseId);
+            writeWordIfPointer(openCountP, 1);
+            writeWordIfPointer(modeP, 0);
+            writeWordIfPointer(cardNoP, 0);
+            if (looksWritablePointer(resDBP))
+            {
+                m68k_write_memory_8(resDBP, 0);
+            }
+            Serial.printf(""  trap dispatch: selector=0x%04X name=%s dbRef=0x%08X dbIDP=0x%08X openCountP=0x%08X modeP=0x%08X cardNoP=0x%08X resDBP=0x%08X -> ok\n"",
+                static_cast<unsigned>(frame.selector),
+                palmTrapName(frame.selector),
+                static_cast<unsigned>(dbRef),
+                static_cast<unsigned>(dbIDP),
+                static_cast<unsigned>(openCountP),
+                static_cast<unsigned>(modeP),
+                static_cast<unsigned>(cardNoP),
+                static_cast<unsigned>(resDBP));
             return handledTrap(frame, 0, 0);
         }
 
@@ -1258,7 +1728,7 @@ PalmTrapResult palmDispatchTrap(const PalmTrapFrame& frame)
                 gFakeMemoDatabaseCreated ? ""yes"" : ""no"",
                 static_cast<unsigned>(requestedType),
                 static_cast<unsigned>(requestedCreator));
-            return handledTrap(frame, 0, foundDb);
+            return handledTrap(frame, foundDb, foundDb);
         }
 
         case 0xA08F:
@@ -1314,9 +1784,12 @@ extern ""C"" {
 
 static constexpr uint32_t kProbeBase = 0x00001000u;
 static constexpr uint32_t kProbeRamSize = 256u;
+static constexpr uint32_t kTrapHeapBase = 0x00002000u;
+static constexpr uint32_t kTrapHeapSize = 1024u;
 static constexpr uint32_t kPalmCodeBase = 0x00010000u;
 static constexpr uint32_t kPalmEntryProbeOffset = 0x10u;
 static uint8_t gProbeRam[kProbeRamSize];
+static uint8_t gTrapHeap[kTrapHeapSize];
 static bool gMusashiInitialized = false;
 static uint32_t gLastUnknownRead = 0;
 static uint32_t gLastUnknownWrite = 0;
@@ -1336,6 +1809,17 @@ static bool probeAddressToOffset(uint32_t address, uint32_t width, uint32_t& off
     return offset + width <= kProbeRamSize;
 }
 
+static bool trapHeapAddressToOffset(uint32_t address, uint32_t width, uint32_t& offset)
+{
+    if (address < kTrapHeapBase)
+    {
+        return false;
+    }
+
+    offset = address - kTrapHeapBase;
+    return offset + width <= kTrapHeapSize;
+}
+
 static uint8_t probeRead8(uint32_t address)
 {
     uint32_t offset = 0;
@@ -1346,6 +1830,11 @@ static uint8_t probeRead8(uint32_t address)
         {
             return gMappedCode->bytes[offset];
         }
+    }
+
+    if (trapHeapAddressToOffset(address, 1, offset))
+    {
+        return gTrapHeap[offset];
     }
 
     if (!probeAddressToOffset(address, 1, offset))
@@ -1360,6 +1849,12 @@ static uint8_t probeRead8(uint32_t address)
 static void probeWrite8(uint32_t address, uint8_t value)
 {
     uint32_t offset = 0;
+    if (trapHeapAddressToOffset(address, 1, offset))
+    {
+        gTrapHeap[offset] = value;
+        return;
+    }
+
     if (!probeAddressToOffset(address, 1, offset))
     {
         gLastUnknownWrite = address;
@@ -1455,6 +1950,7 @@ static void ensureMusashiInitialized()
 static void runSyntheticMusashiProbe()
 {
     memset(gProbeRam, 0, sizeof(gProbeRam));
+    memset(gTrapHeap, 0, sizeof(gTrapHeap));
     gMappedCode = nullptr;
     gLastUnknownRead = 0;
     gLastUnknownWrite = 0;
@@ -1499,6 +1995,7 @@ static void runPalmCodeMapProbe(const PalmLoadedApp& app)
     }
 
     memset(gProbeRam, 0, sizeof(gProbeRam));
+    memset(gTrapHeap, 0, sizeof(gTrapHeap));
     gMappedCode = code1;
     gLastUnknownRead = 0;
     gLastUnknownWrite = 0;
@@ -1619,6 +2116,7 @@ static void runPalmTrapVisibilityProbe(const PalmLoadedApp& app)
     }
 
     memset(gProbeRam, 0, sizeof(gProbeRam));
+    memset(gTrapHeap, 0, sizeof(gTrapHeap));
     gMappedCode = code1;
     gLastUnknownRead = 0;
     gLastUnknownWrite = 0;
@@ -1819,7 +2317,15 @@ bool palmDisplayBegin();
 void palmDisplayBacklightOff();
 void palmDisplayShowLoaderSmoke(const PalmLoadedApp* apps, size_t appCount);
 void palmDisplayShowRuntimeUiProbe(uint16_t selector, uint32_t trapCount);
-void palmDisplayShowMemoPadProbe(uint16_t selector, uint32_t trapCount, const char* capturedText);
+void palmDisplayShowMemoPadProbe(uint16_t selector, uint32_t trapCount, const char* titleText, const char* memoText);
+void palmDisplayApplyPalmUiTrap(uint16_t selector, uint32_t trapCount, uint8_t role, const char* text);
+void palmDisplayPalmUiBeginForm(uint16_t selector, uint32_t trapCount, const char* titleText);
+void palmDisplayPalmUiSetCategory(uint16_t selector, uint32_t trapCount, const char* categoryText);
+void palmDisplayPalmUiSetListCount(uint16_t selector, uint32_t trapCount, uint16_t recordCount);
+void palmDisplayPalmUiSetListRow(uint16_t selector, uint32_t trapCount, uint16_t rowIndex, const char* text);
+void palmDisplayPalmUiDrawButton(uint16_t selector, uint32_t trapCount, uint16_t controlId, const char* labelText);
+void palmDisplayPalmUiDrawText(uint16_t selector, uint32_t trapCount, int16_t x, int16_t y, const char* text);
+void palmDisplayPollSerialCommands();
 "
     End Function
 
@@ -1831,6 +2337,7 @@ void palmDisplayShowMemoPadProbe(uint16_t selector, uint32_t trapCount, const ch
 #include <esp_heap_caps.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_rgb.h>
+#include <cstring>
 
 static constexpr int kScreenW = 480;
 static constexpr int kScreenH = 272;
@@ -1870,6 +2377,19 @@ static size_t gDisplayAppCount = 0;
 static uint32_t gDisplayGeneration = 0;
 static volatile uint32_t gDisplayedFrames = 0;
 static uint16_t* gFrameBuffer = nullptr;
+static char gPalmUiTitle[32] = ""Memo Pad"";
+static char gPalmUiCategory[16] = ""All"";
+static char gPalmUiMemo[32] = """";
+static char gPalmUiRows[5][32] = {};
+static char gPalmUiNewButton[16] = """";
+static char gPalmUiDetailsButton[16] = """";
+static uint16_t gPalmUiListCount = 0;
+static bool gPalmUiCategoryVisible = false;
+static bool gPalmUiSurfaceStarted = false;
+
+static constexpr uint8_t kPalmUiRoleForm = 1;
+static constexpr uint8_t kPalmUiRoleTitle = 2;
+static constexpr uint8_t kPalmUiRoleMemoText = 3;
 
 static uint16_t rgb565(uint8_t r, uint8_t g, uint8_t b)
 {
@@ -2066,16 +2586,23 @@ static uint8_t glyphRow(char ch, int row)
     {
         case 'A': return (const uint8_t[7]){0x0E,0x11,0x11,0x1F,0x11,0x11,0x11}[row];
         case 'D': return (const uint8_t[7]){0x1E,0x11,0x11,0x11,0x11,0x11,0x1E}[row];
+        case 'E': return (const uint8_t[7]){0x1F,0x10,0x10,0x1E,0x10,0x10,0x1F}[row];
+        case 'H': return (const uint8_t[7]){0x11,0x11,0x11,0x1F,0x11,0x11,0x11}[row];
         case 'I': return (const uint8_t[7]){0x0E,0x04,0x04,0x04,0x04,0x04,0x0E}[row];
         case 'M': return (const uint8_t[7]){0x11,0x1B,0x15,0x15,0x11,0x11,0x11}[row];
         case 'N': return (const uint8_t[7]){0x11,0x19,0x15,0x13,0x11,0x11,0x11}[row];
         case 'P': return (const uint8_t[7]){0x1E,0x11,0x11,0x1E,0x10,0x10,0x10}[row];
         case 'R': return (const uint8_t[7]){0x1E,0x11,0x11,0x1E,0x14,0x12,0x11}[row];
+        case 'S': return (const uint8_t[7]){0x0F,0x10,0x10,0x0E,0x01,0x01,0x1E}[row];
         case 'T': return (const uint8_t[7]){0x1F,0x04,0x04,0x04,0x04,0x04,0x04}[row];
         case 'U': return (const uint8_t[7]){0x11,0x11,0x11,0x11,0x11,0x11,0x0E}[row];
         case 'a': return (const uint8_t[7]){0x00,0x00,0x0E,0x01,0x0F,0x11,0x0F}[row];
+        case 'c': return (const uint8_t[7]){0x00,0x00,0x0F,0x10,0x10,0x10,0x0F}[row];
         case 'd': return (const uint8_t[7]){0x01,0x01,0x0F,0x11,0x11,0x11,0x0F}[row];
         case 'e': return (const uint8_t[7]){0x00,0x00,0x0E,0x11,0x1F,0x10,0x0E}[row];
+        case 'f': return (const uint8_t[7]){0x06,0x08,0x08,0x1E,0x08,0x08,0x08}[row];
+        case 'g': return (const uint8_t[7]){0x00,0x00,0x0F,0x11,0x0F,0x01,0x0E}[row];
+        case 'h': return (const uint8_t[7]){0x10,0x10,0x1E,0x11,0x11,0x11,0x11}[row];
         case 'i': return (const uint8_t[7]){0x04,0x00,0x0C,0x04,0x04,0x04,0x0E}[row];
         case 'l': return (const uint8_t[7]){0x0C,0x04,0x04,0x04,0x04,0x04,0x0E}[row];
         case 'm': return (const uint8_t[7]){0x00,0x00,0x1A,0x15,0x15,0x15,0x15}[row];
@@ -2083,9 +2610,12 @@ static uint8_t glyphRow(char ch, int row)
         case 'o': return (const uint8_t[7]){0x00,0x00,0x0E,0x11,0x11,0x11,0x0E}[row];
         case 'p': return (const uint8_t[7]){0x00,0x00,0x1E,0x11,0x1E,0x10,0x10}[row];
         case 'r': return (const uint8_t[7]){0x00,0x00,0x16,0x19,0x10,0x10,0x10}[row];
+        case 's': return (const uint8_t[7]){0x00,0x00,0x0F,0x10,0x0E,0x01,0x1E}[row];
         case 't': return (const uint8_t[7]){0x04,0x04,0x1F,0x04,0x04,0x05,0x02}[row];
         case 'u': return (const uint8_t[7]){0x00,0x00,0x11,0x11,0x11,0x13,0x0D}[row];
+        case 'v': return (const uint8_t[7]){0x00,0x00,0x11,0x11,0x11,0x0A,0x04}[row];
         case 'w': return (const uint8_t[7]){0x00,0x00,0x11,0x11,0x15,0x15,0x0A}[row];
+        case 'x': return (const uint8_t[7]){0x00,0x00,0x11,0x0A,0x04,0x0A,0x11}[row];
         case '0': return (const uint8_t[7]){0x0E,0x11,0x13,0x15,0x19,0x11,0x0E}[row];
         case '1': return (const uint8_t[7]){0x04,0x0C,0x04,0x04,0x04,0x04,0x0E}[row];
         case '2': return (const uint8_t[7]){0x0E,0x11,0x01,0x02,0x04,0x08,0x1F}[row];
@@ -2136,6 +2666,21 @@ static void fillPalmRect(int x, int y, int w, int h, uint16_t color)
     }
 }
 
+static void drawPalmRectOutline(int x, int y, int w, int h, uint16_t color)
+{
+    fillPalmRect(x, y, w, 1, color);
+    fillPalmRect(x, y + h - 1, w, 1, color);
+    fillPalmRect(x, y, 1, h, color);
+    fillPalmRect(x + w - 1, y, 1, h, color);
+}
+
+static void drawPalmPopupArrow(int x, int y, uint16_t color)
+{
+    fillPalmRect(x, y, 5, 1, color);
+    fillPalmRect(x + 1, y + 1, 3, 1, color);
+    fillPalmRect(x + 2, y + 2, 1, 1, color);
+}
+
 static void drawPalmText(int x, int y, const char* text, uint16_t color, int scale)
 {
     int cursor = x;
@@ -2157,7 +2702,59 @@ static void drawPalmText(int x, int y, const char* text, uint16_t color, int sca
     }
 }
 
-static void renderMemoPadProbeFrame(uint16_t selector, uint32_t trapCount, const char* capturedText)
+static void drawPalmButton(int x, int y, int w, int h, const char* text, uint16_t bg, uint16_t ink)
+{
+    fillPalmRect(x, y, w, h, bg);
+    drawPalmRectOutline(x, y, w, h, ink);
+    fillPalmRect(x + 1, y + 1, w - 2, 1, 0xFFFFu);
+    fillPalmRect(x + 1, y + 1, 1, h - 2, 0xFFFFu);
+    const int textW = static_cast<int>(strlen(text)) * 6 - 1;
+    drawPalmText(x + (w - textW) / 2, y + 3, text, ink, 1);
+}
+
+static void copyPalmUiText(char* destination, size_t destinationSize, const char* source)
+{
+    if (destinationSize == 0 || source == nullptr || source[0] == '\0')
+    {
+        return;
+    }
+
+    strncpy(destination, source, destinationSize);
+    destination[destinationSize - 1] = '\0';
+}
+
+static void resetPalmUiSurface(const char* titleText)
+{
+    copyPalmUiText(gPalmUiTitle, sizeof(gPalmUiTitle), titleText != nullptr && titleText[0] != '\0' ? titleText : ""Memo Pad"");
+    strncpy(gPalmUiCategory, ""All"", sizeof(gPalmUiCategory));
+    gPalmUiCategory[sizeof(gPalmUiCategory) - 1] = '\0';
+    gPalmUiMemo[0] = '\0';
+    gPalmUiNewButton[0] = '\0';
+    gPalmUiDetailsButton[0] = '\0';
+    for (size_t i = 0; i < sizeof(gPalmUiRows) / sizeof(gPalmUiRows[0]); ++i)
+    {
+        gPalmUiRows[i][0] = '\0';
+    }
+    gPalmUiListCount = 0;
+    gPalmUiCategoryVisible = false;
+    gPalmUiSurfaceStarted = true;
+}
+
+static void renderMemoPadUiSurface(uint16_t selector, uint32_t trapCount);
+
+static void presentPalmUiSurface(uint16_t selector, uint32_t trapCount)
+{
+    ++gDisplayGeneration;
+    renderMemoPadUiSurface(selector, trapCount);
+
+    if (gPanel != nullptr)
+    {
+        ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(gPanel, 0, 0, kScreenW, kScreenH, gFrameBuffer));
+        esp_lcd_panel_disp_on_off(gPanel, true);
+    }
+}
+
+static void renderMemoPadUiSurface(uint16_t selector, uint32_t trapCount)
 {
     renderRuntimeUiProbeFrame(selector, trapCount);
 
@@ -2165,32 +2762,78 @@ static void renderMemoPadProbeFrame(uint16_t selector, uint32_t trapCount, const
     // swaps and make the Palm UI shape readable while color order is unknown.
     const uint16_t lcdBg = 0xFFFFu;
     const uint16_t lcdInk = 0x0000u;
-    const uint16_t title = 0xC618u;
-    const uint16_t titleDark = 0x0000u;
+    const uint16_t chrome = 0x0000u;
+    const uint16_t chromeLight = 0xE71Cu;
     const uint16_t line = 0x8410u;
+    const uint16_t shadow = 0xA514u;
 
     fillPalmRect(3, 3, 154, 154, lcdBg);
-    fillPalmRect(3, 3, 154, 18, title);
-    fillPalmRect(3, 20, 154, 1, lcdInk);
-    drawPalmText(9, 7, ""Memo Pad"", lcdInk, 1);
-    drawPalmText(112, 7, ""All"", lcdInk, 1);
+    drawPalmRectOutline(3, 3, 154, 154, lcdInk);
 
-    for (int y = 34; y < 139; y += 17)
+    fillPalmRect(4, 4, 152, 17, chrome);
+    fillPalmRect(4, 21, 152, 1, lcdInk);
+    drawPalmText(9, 8, gPalmUiTitle, lcdBg, 1);
+
+    if (gPalmUiCategoryVisible)
     {
-        fillPalmRect(10, y, 138, 1, line);
+        fillPalmRect(108, 6, 43, 12, lcdBg);
+        drawPalmRectOutline(108, 6, 43, 12, lcdBg);
+        drawPalmText(113, 9, gPalmUiCategory, lcdInk, 1);
+        drawPalmPopupArrow(143, 11, lcdInk);
     }
 
-    drawPalmText(13, 30, ""New Memo"", lcdInk, 1);
-    drawPalmText(13, 48, ""Memo runtime"", lcdInk, 1);
-    drawPalmText(13, 66, capturedText != nullptr && capturedText[0] != '\0' ? capturedText : ""Trap UI"", lcdInk, 1);
-    drawPalmText(13, 145, ""Trap #"", titleDark, 1);
+    fillPalmRect(147, 24, 7, 111, chromeLight);
+    drawPalmRectOutline(147, 24, 7, 111, lcdInk);
+    const int visibleRows = 5;
+    const int trackY = 27;
+    const int trackH = 104;
+    const int thumbH = gPalmUiListCount > visibleRows ? 34 : trackH - 6;
+    fillPalmRect(149, trackY, 3, thumbH, gPalmUiListCount > visibleRows ? shadow : line);
 
-    char trapDigits[4];
-    trapDigits[0] = static_cast<char>('0' + ((trapCount / 100u) % 10u));
-    trapDigits[1] = static_cast<char>('0' + ((trapCount / 10u) % 10u));
-    trapDigits[2] = static_cast<char>('0' + (trapCount % 10u));
-    trapDigits[3] = '\0';
-    drawPalmText(55, 145, trapDigits, titleDark, 1);
+    for (int y = 42; y < 133; y += 18)
+    {
+        fillPalmRect(8, y, 136, 1, line);
+    }
+
+    if (gPalmUiListCount == 0 && gPalmUiRows[0][0] == '\0' && gPalmUiMemo[0] == '\0')
+    {
+        drawPalmText(12, 29, ""No Memos"", line, 1);
+    }
+
+    for (int row = 0; row < visibleRows; ++row)
+    {
+        if (gPalmUiRows[row][0] != '\0')
+        {
+            drawPalmText(12, 29 + row * 18, gPalmUiRows[row], lcdInk, 1);
+        }
+    }
+
+    if (gPalmUiRows[0][0] == '\0' && gPalmUiMemo[0] != '\0')
+    {
+        drawPalmText(12, 29, gPalmUiMemo, lcdInk, 1);
+    }
+
+    fillPalmRect(4, 136, 152, 1, lcdInk);
+    if (gPalmUiNewButton[0] != '\0')
+    {
+        drawPalmButton(13, 142, 39, 13, gPalmUiNewButton, chromeLight, lcdInk);
+    }
+    if (gPalmUiDetailsButton[0] != '\0')
+    {
+        drawPalmButton(61, 142, 63, 13, gPalmUiDetailsButton, chromeLight, lcdInk);
+    }
+}
+
+static void renderMemoPadProbeFrame(uint16_t selector, uint32_t trapCount, const char* titleText, const char* memoText)
+{
+    if (!gPalmUiSurfaceStarted)
+    {
+        resetPalmUiSurface(titleText);
+    }
+
+    copyPalmUiText(gPalmUiTitle, sizeof(gPalmUiTitle), titleText);
+    copyPalmUiText(gPalmUiMemo, sizeof(gPalmUiMemo), memoText);
+    renderMemoPadUiSurface(selector, trapCount);
 }
 
 bool palmDisplayBegin()
@@ -2327,27 +2970,288 @@ void palmDisplayShowRuntimeUiProbe(uint16_t selector, uint32_t trapCount)
         static_cast<unsigned>(gDisplayGeneration));
 }
 
-void palmDisplayShowMemoPadProbe(uint16_t selector, uint32_t trapCount, const char* capturedText)
+void palmDisplayShowMemoPadProbe(uint16_t selector, uint32_t trapCount, const char* titleText, const char* memoText)
 {
     if (!palmDisplayBegin())
     {
         return;
     }
 
-    ++gDisplayGeneration;
-    renderMemoPadProbeFrame(selector, trapCount, capturedText);
+    renderMemoPadProbeFrame(selector, trapCount, titleText, memoText);
+    presentPalmUiSurface(selector, trapCount);
 
-    if (gPanel != nullptr)
-    {
-        ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(gPanel, 0, 0, kScreenW, kScreenH, gFrameBuffer));
-        esp_lcd_panel_disp_on_off(gPanel, true);
-    }
-
-    Serial.printf(""LCD Memo Pad probe selector=0x%04X traps=%u text='%s' generation=%u\n"",
+    Serial.printf(""LCD Memo Pad probe selector=0x%04X traps=%u title='%s' memo='%s' generation=%u\n"",
         static_cast<unsigned>(selector),
         static_cast<unsigned>(trapCount),
-        capturedText != nullptr ? capturedText : """",
+        titleText != nullptr ? titleText : """",
+        memoText != nullptr ? memoText : """",
         static_cast<unsigned>(gDisplayGeneration));
+}
+
+void palmDisplayApplyPalmUiTrap(uint16_t selector, uint32_t trapCount, uint8_t role, const char* text)
+{
+    if (!palmDisplayBegin())
+    {
+        return;
+    }
+
+    if (!gPalmUiSurfaceStarted || role == kPalmUiRoleForm)
+    {
+        resetPalmUiSurface(text);
+    }
+    else if (role == kPalmUiRoleTitle)
+    {
+        copyPalmUiText(gPalmUiTitle, sizeof(gPalmUiTitle), text);
+    }
+    else if (role == kPalmUiRoleMemoText)
+    {
+        copyPalmUiText(gPalmUiMemo, sizeof(gPalmUiMemo), text);
+    }
+
+    presentPalmUiSurface(selector, trapCount);
+
+    Serial.printf(""LCD Palm UI trap selector=0x%04X traps=%u role=%u title='%s' memo='%s' generation=%u\n"",
+        static_cast<unsigned>(selector),
+        static_cast<unsigned>(trapCount),
+        static_cast<unsigned>(role),
+        gPalmUiTitle,
+        gPalmUiMemo,
+        static_cast<unsigned>(gDisplayGeneration));
+}
+
+void palmDisplayPalmUiBeginForm(uint16_t selector, uint32_t trapCount, const char* titleText)
+{
+    if (!palmDisplayBegin())
+    {
+        return;
+    }
+
+    resetPalmUiSurface(titleText);
+    presentPalmUiSurface(selector, trapCount);
+    Serial.printf(""LCD Palm form selector=0x%04X traps=%u title='%s' generation=%u\n"",
+        static_cast<unsigned>(selector),
+        static_cast<unsigned>(trapCount),
+        gPalmUiTitle,
+        static_cast<unsigned>(gDisplayGeneration));
+}
+
+void palmDisplayPalmUiSetCategory(uint16_t selector, uint32_t trapCount, const char* categoryText)
+{
+    if (!palmDisplayBegin())
+    {
+        return;
+    }
+
+    if (!gPalmUiSurfaceStarted)
+    {
+        resetPalmUiSurface(""Memo Pad"");
+    }
+
+    copyPalmUiText(gPalmUiCategory, sizeof(gPalmUiCategory), categoryText);
+    gPalmUiCategoryVisible = true;
+    presentPalmUiSurface(selector, trapCount);
+    Serial.printf(""LCD Palm category selector=0x%04X traps=%u text='%s' generation=%u\n"",
+        static_cast<unsigned>(selector),
+        static_cast<unsigned>(trapCount),
+        gPalmUiCategory,
+        static_cast<unsigned>(gDisplayGeneration));
+}
+
+void palmDisplayPalmUiSetListCount(uint16_t selector, uint32_t trapCount, uint16_t recordCount)
+{
+    if (!palmDisplayBegin())
+    {
+        return;
+    }
+
+    if (!gPalmUiSurfaceStarted)
+    {
+        resetPalmUiSurface(""Memo Pad"");
+    }
+
+    gPalmUiListCount = recordCount;
+    presentPalmUiSurface(selector, trapCount);
+    Serial.printf(""LCD Palm list selector=0x%04X traps=%u records=%u generation=%u\n"",
+        static_cast<unsigned>(selector),
+        static_cast<unsigned>(trapCount),
+        static_cast<unsigned>(gPalmUiListCount),
+        static_cast<unsigned>(gDisplayGeneration));
+}
+
+void palmDisplayPalmUiSetListRow(uint16_t selector, uint32_t trapCount, uint16_t rowIndex, const char* text)
+{
+    if (!palmDisplayBegin())
+    {
+        return;
+    }
+
+    if (!gPalmUiSurfaceStarted)
+    {
+        resetPalmUiSurface(""Memo Pad"");
+    }
+
+    if (rowIndex < sizeof(gPalmUiRows) / sizeof(gPalmUiRows[0]))
+    {
+        copyPalmUiText(gPalmUiRows[rowIndex], sizeof(gPalmUiRows[rowIndex]), text);
+        if (rowIndex == 0)
+        {
+            copyPalmUiText(gPalmUiMemo, sizeof(gPalmUiMemo), text);
+        }
+    }
+
+    presentPalmUiSurface(selector, trapCount);
+    Serial.printf(""LCD Palm list row selector=0x%04X traps=%u row=%u text='%s' generation=%u\n"",
+        static_cast<unsigned>(selector),
+        static_cast<unsigned>(trapCount),
+        static_cast<unsigned>(rowIndex),
+        text != nullptr ? text : """",
+        static_cast<unsigned>(gDisplayGeneration));
+}
+
+void palmDisplayPalmUiDrawText(uint16_t selector, uint32_t trapCount, int16_t x, int16_t y, const char* text)
+{
+    if (!palmDisplayBegin())
+    {
+        return;
+    }
+
+    if (!gPalmUiSurfaceStarted)
+    {
+        resetPalmUiSurface(""Memo Pad"");
+    }
+
+    if (y < 22)
+    {
+        copyPalmUiText(gPalmUiTitle, sizeof(gPalmUiTitle), text);
+    }
+    else
+    {
+        copyPalmUiText(gPalmUiMemo, sizeof(gPalmUiMemo), text);
+    }
+
+    presentPalmUiSurface(selector, trapCount);
+    Serial.printf(""LCD Palm text selector=0x%04X traps=%u x=%d y=%d text='%s' generation=%u\n"",
+        static_cast<unsigned>(selector),
+        static_cast<unsigned>(trapCount),
+        static_cast<int>(x),
+        static_cast<int>(y),
+        text != nullptr ? text : """",
+        static_cast<unsigned>(gDisplayGeneration));
+}
+
+void palmDisplayPalmUiDrawButton(uint16_t selector, uint32_t trapCount, uint16_t controlId, const char* labelText)
+{
+    if (!palmDisplayBegin())
+    {
+        return;
+    }
+
+    if (!gPalmUiSurfaceStarted)
+    {
+        resetPalmUiSurface(""Memo Pad"");
+    }
+
+    if (controlId == 1001u)
+    {
+        copyPalmUiText(gPalmUiNewButton, sizeof(gPalmUiNewButton), labelText);
+    }
+    else if (controlId == 1002u)
+    {
+        copyPalmUiText(gPalmUiDetailsButton, sizeof(gPalmUiDetailsButton), labelText);
+    }
+
+    presentPalmUiSurface(selector, trapCount);
+    Serial.printf(""LCD Palm button selector=0x%04X traps=%u id=%u label='%s' generation=%u\n"",
+        static_cast<unsigned>(selector),
+        static_cast<unsigned>(trapCount),
+        static_cast<unsigned>(controlId),
+        labelText != nullptr ? labelText : """",
+        static_cast<unsigned>(gDisplayGeneration));
+}
+
+static uint16_t readPalmPixelRgb565(int palmX, int palmY)
+{
+    if (gFrameBuffer == nullptr || palmX < 0 || palmY < 0 || palmX >= kPalmLcdW || palmY >= kPalmLcdH)
+    {
+        return 0;
+    }
+
+    const int screenX = kPalmLcdViewX + (palmX * kPalmLcdViewW) / kPalmLcdW;
+    const int screenY = kPalmLcdViewY + (palmY * kPalmLcdViewH) / kPalmLcdH;
+    return gFrameBuffer[static_cast<uint32_t>(screenY) * kScreenW + screenX];
+}
+
+static void writePalmLcdSnapshotSerial()
+{
+    if (!palmDisplayBegin())
+    {
+        Serial.println(""PALM_LCD_SNAPSHOT_ERROR display_not_ready"");
+        return;
+    }
+
+    Serial.printf(""PALM_LCD_SNAPSHOT_BEGIN %d %d RGB565BE %u\n"",
+        kPalmLcdW,
+        kPalmLcdH,
+        static_cast<unsigned>(gDisplayGeneration));
+
+    uint8_t bytes[64];
+    size_t used = 0;
+    for (int y = 0; y < kPalmLcdH; ++y)
+    {
+        for (int x = 0; x < kPalmLcdW; ++x)
+        {
+            const uint16_t pixel = readPalmPixelRgb565(x, y);
+            bytes[used++] = static_cast<uint8_t>((pixel >> 8) & 0xffu);
+            bytes[used++] = static_cast<uint8_t>(pixel & 0xffu);
+            if (used == sizeof(bytes))
+            {
+                Serial.write(bytes, used);
+                used = 0;
+            }
+        }
+    }
+
+    if (used > 0)
+    {
+        Serial.write(bytes, used);
+    }
+
+    Serial.print(""\nPALM_LCD_SNAPSHOT_END\n"");
+}
+
+void palmDisplayPollSerialCommands()
+{
+    static char command[24];
+    static uint8_t length = 0;
+
+    while (Serial.available() > 0)
+    {
+        const char ch = static_cast<char>(Serial.read());
+        if (ch == '\r')
+        {
+            continue;
+        }
+
+        if (ch == '\n')
+        {
+            command[length] = '\0';
+            if (strcmp(command, ""lcdsnap"") == 0 || strcmp(command, ""LCDSNAP"") == 0)
+            {
+                writePalmLcdSnapshotSerial();
+            }
+            else if (length > 0)
+            {
+                Serial.printf(""PALM_LCD_UNKNOWN_COMMAND %s\n"", command);
+            }
+            length = 0;
+            continue;
+        }
+
+        if (length + 1u < sizeof(command))
+        {
+            command[length++] = ch;
+        }
+    }
 }
 "
     End Function
