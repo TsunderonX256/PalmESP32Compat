@@ -66,6 +66,27 @@ Public NotInheritable Class PalmRomScanner
         File.WriteAllBytes(outputPath, output)
     End Sub
 
+    Public Shared Function ReadResourceData(rom As Byte(), db As PalmDatabase) As List(Of PalmResourceData)
+        If Not db.IsResourceDatabase Then
+            Return New List(Of PalmResourceData)()
+        End If
+
+        Dim ranges = GetEntryRanges(rom.Length, db)
+        Dim resources As New List(Of PalmResourceData)()
+        For i = 0 To CInt(db.EntryCount) - 1
+            Dim entryOffset = db.StartOffset + PalmDatabaseConstants.DatabaseHeaderSize + i * PalmDatabaseConstants.ResourceEntrySize
+            Dim range = ranges(i)
+            resources.Add(New PalmResourceData With {
+                .TypeCode = ReadAscii(rom, entryOffset, 4),
+                .ResourceId = ReadUInt16BE(rom, entryOffset + 4),
+                .StartOffset = range.Start,
+                .Length = range.Length
+            })
+        Next
+
+        Return resources
+    End Function
+
     Public Shared Function MakeSafeFileName(value As String) As String
         Dim invalid = Path.GetInvalidFileNameChars()
         Dim chars = value.Select(Function(ch) If(invalid.Contains(ch), "_"c, ch)).ToArray()
@@ -313,4 +334,3 @@ Public NotInheritable Class PalmRomScanner
         Public ReadOnly Property Length As Integer
     End Class
 End Class
-

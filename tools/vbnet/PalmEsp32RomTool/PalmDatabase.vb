@@ -25,6 +25,13 @@ Public NotInheritable Class PalmDatabase
     End Property
 End Class
 
+Public NotInheritable Class PalmResourceData
+    Public Property TypeCode As String = ""
+    Public Property ResourceId As UShort
+    Public Property StartOffset As Integer
+    Public Property Length As Integer
+End Class
+
 Public Module PalmDatabaseConstants
     Public Const DatabaseHeaderSize As Integer = 78
     Public Const ResourceEntrySize As Integer = 10
@@ -33,4 +40,3 @@ Public Module PalmDatabaseConstants
     Public Const ReadOnlyDatabaseAttribute As UShort = &H2US
     Public Const OpenDatabaseAttribute As UShort = &H8000US
 End Module
-
