@@ -33,6 +33,8 @@ tests/
 docs/
   architecture.md  Runtime design notes
   trap-map.md      Palm OS trap coverage tracker
+  native-esp32-trap-reference.md
+                   Native ESP32 trap/function reference for verified shims
 ```
 
 ## VB.NET Converter
