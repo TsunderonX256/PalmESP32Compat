@@ -20,9 +20,9 @@ Status meanings:
 | 68K app launch | `palm_68k_runtime.cpp`, generated app manifest | Memo Pad PRC launches from the converted ROM output. |
 | Trap dispatch | `palm_traps.cpp` generated from `Esp32ProjectGenerator.vb` | Palm OS traps are intercepted and routed to native C/C++ handlers. |
 | LCD renderer | `palm_display.cpp` generated from `Esp32ProjectGenerator.vb` | 160x160 Palm LCD surface draws on the ESP32 panel and can be captured over UART with `lcdsnap`. |
-| UART test input | `palm_display.cpp` | `tap x y`, `text ...`, and `lcdsnap` commands exercise the native UI surface. |
-| Memo list form | `fakeFormDecodeFromResource`, `renderMemoPadUiSurface` | Real ROM `tFRM #1000` geometry is decoded for title, category trigger, table, scrollbar, and New button. |
-| Category popup | `drawPalmCategoryPopupList`, `palmDisplayPalmUiHandleTap` | Tapping the real `All` trigger draws native `All` / `Unfiled` popup and updates selector text. |
+| UART test input | `palm_display.cpp`, `PalmEsp32RomTool` | `tap x y`, `text ...`, `lcdsnap`, and one-session `tap-snapshot` checks exercise the native UI surface. |
+| Memo list form | `fakeFormDecodeFromResource`, `renderMemoPadUiSurface` | Real ROM `tFRM #1000` geometry is decoded for title, category trigger, hidden category list, table, scrollbar, and New button. |
+| Category popup | `fakeFormLinkPopupMetadata`, `drawPalmCategoryPopupList`, `palmDisplayPalmUiHandleTap` | Tapping the real `All` trigger draws native `All` / `Unfiled` popup using the decoded hidden list bounds, and updates selector text. |
 | Memo table callback | Table Manager shim plus native draw overlay | Real Memo row draw callback renders record titles into the native table area. |
 
 ## Native Trap Table
@@ -80,7 +80,7 @@ Status meanings:
 
 | Trap | Palm function | Status | Native behavior |
 | --- | --- | --- | --- |
-| `0xA16F` | `FrmInitForm` | partial native | Allocates fake `FormPtr`, decodes known `tFRM` resources, seeds native object metadata. |
+| `0xA16F` | `FrmInitForm` | partial native | Allocates fake `FormPtr`, decodes known `tFRM` resources, seeds native object metadata, and links popup trigger/list companions. |
 | `0xA170` | `FrmDeleteForm` | shim | Clears active fake form state. |
 | `0xA171` | `FrmDrawForm` | native | Draws native Memo surface from current form/object bounds and rows. |
 | `0xA172` | `FrmEraseForm` | shim | Accepts erase for active fake form. |
@@ -226,8 +226,8 @@ Status meanings:
 
 | Area | Gap |
 | --- | --- |
-| Form resources | `tFRM` decoding handles Memo's current form well, but object type `10` and category-list object type `2` are still treated as skipped metadata rather than full native objects. |
-| Category Manager | Native popup works visually, but full Palm category dialogs, category persistence, and database category filtering are simplified. |
+| Form resources | `tFRM` decoding handles Memo's current form and now preserves popup trigger/list companions, but broader Palm form object classes still need decoding and validation against more apps. |
+| Category Manager | Native popup works visually and the resource trigger/list link is tracked, but full Palm category dialogs, category persistence, and database category filtering are simplified. |
 | Table Manager | Memo draw callbacks work, but the table API is still focused on Memo list behavior rather than a general table widget implementation. |
 | Window Manager | Drawing is useful for Memo, but window stack, offscreen windows, clipping edge cases, and save/restore bits are simplified. |
 | Database Manager | Editable records use native dynamic handles, but full Palm database metadata, sorting, categories, sync flags, and persistence are not complete. |

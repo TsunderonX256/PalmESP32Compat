@@ -16,6 +16,31 @@ This repo is intentionally separate from the full-ROM emulator so behavior can b
 - Implement enough memory, event, UI, and database APIs to run simple Palm OS 3.x/4.x apps.
 - Build comparison tests against the original emulator using shared event traces and framebuffer output.
 
+## Real Palm OS UI Milestone
+
+This milestone tracks what is still needed before ROM-defined Palm OS UI
+elements are reliably owned by native ESP32 code instead of Memo-specific
+shortcuts.
+
+- Complete `tFRM` object decoding for more Palm form object classes, not only
+  the current Memo Pad controls, list, table, scrollbar, and popup metadata.
+- Make the native object model match Palm managers more closely for forms,
+  controls, lists, tables, fields, scrollbars, menus, and windows, including
+  pointer/state lifetimes expected by 68K app code.
+- Make `FrmDispatchEvent`, `FrmHandleEvent`, object handlers, and form callback
+  return paths behave more like Palm OS so app handlers drive UI behavior.
+- Improve Palm-style drawing accuracy for control frames, popup/list borders,
+  scrollbars, clipping, inversion, selected/disabled states, modal frames, and
+  text alignment.
+- Use ROM/PRC resources more fully, including fonts, bitmaps, forms, menus,
+  alerts, and strings where available.
+- Move field and text editing toward real `Fld*` manager behavior, including
+  insertion, deletion, selection, caret state, dirty state, and database commit.
+- Expand database and category behavior for record categories, sorting, unique
+  ids, dirty/archive/delete flags, and persistence.
+- Expand the QEMU/headless ESP32 test rig from boot/log smoke tests into
+  host-driven framebuffer snapshots and tap/text interaction tests.
+
 ## Repository Layout
 
 ```text
@@ -44,8 +69,10 @@ The first tool lives at `tools/vbnet/PalmEsp32RomTool`.
 ```text
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- inspect <rom-file>
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- generate <rom-file> <output-dir> --all
+dotnet run --project tools/vbnet/PalmEsp32RomTool -- generate <rom-file> out/PalmOS4MemoPadSmokeQemu --app-name "Memo Pad" --hardware-profile esp32-palm-m505-qemu
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- trap-map --markdown
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- snapshot COM4 out/palm-lcd.bmp
+dotnet run --project tools/vbnet/PalmEsp32RomTool -- tap-snapshot COM4 145 6 out/category-popup.bmp
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- tap COM4 24 92
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- tap COM4 92 148
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- text COM4 "New memo from UART"
@@ -58,14 +85,23 @@ The generated ESP32 project currently contains:
 - generated C++ app manifest
 - placeholder runtime entry points for 68K emulation and native Palm trap dispatch
 
+For emulator-first testing, generate with `--hardware-profile
+esp32-palm-m505-qemu`, build with PlatformIO, run `platformio run -t buildfs`,
+merge the firmware and SPIFFS images with `tools/qemu-esp32`, then run the
+timed QEMU smoke. The current headless profile skips real RGB panel/backlight
+setup, avoids physical-board PSRAM assumptions, and reaches Memo Pad's
+headless native LCD/UI path under ESP32-S3 QEMU.
+
 The Memo Pad smoke path now includes a native ESP32 Palm API shim for the fake
 Memo database, Palm-like UI drawing, 25% default backlight when the LCD is in
 use, a `lcdsnap` UART command that the VB.NET `snapshot` command saves as a
 BMP, a `tap x y` UART command that queues Palm pen events and updates the
-native Memo UI probe, and a `text ...` UART command for filling the current
-native edit field. Tapping `Details` opens a first native Palm-style modal
-dialog; tapping its `OK` button closes it. Tapping `New`, sending text, and
-tapping `Done` prepends a new synthetic memo record for the current runtime.
+native Memo UI probe, a `tap-snapshot` command for one-session visual checks on
+boards that reset when the serial port opens, and a `text ...` UART command for
+filling the current native edit field. Tapping `Details` opens a first native
+Palm-style modal dialog; tapping its `OK` button closes it. Tapping `New`,
+sending text, and tapping `Done` prepends a new synthetic memo record for the
+current runtime.
 The Data Manager shim now also has an initial writable record path for
 `DmNewRecord`, `DmResizeRecord`, `DmWrite`, `DmStrCopy`, and dirty
 `DmReleaseRecord`. The Field Manager shim has a first active-field text buffer

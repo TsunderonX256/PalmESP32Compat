@@ -20,6 +20,8 @@ Module Program
                     Return GenerateProject(args)
                 Case "snapshot"
                     Return CaptureSnapshot(args)
+                Case "tap-snapshot"
+                    Return CaptureTapSnapshot(args)
                 Case "tap"
                     Return SendTap(args)
                 Case "text"
@@ -61,34 +63,78 @@ Module Program
             port.Open()
             port.DiscardInBuffer()
             port.DiscardOutBuffer()
-            port.Write("lcdsnap" & vbLf)
-
-            Dim header = ReadUntilSnapshotHeader(port, timeoutMs)
-            Dim parts = header.Split(" "c, StringSplitOptions.RemoveEmptyEntries)
-            If parts.Length < 5 OrElse Not parts(0).Equals("PALM_LCD_SNAPSHOT_BEGIN", StringComparison.Ordinal) Then
-                Throw New InvalidDataException($"unexpected snapshot header: {header}")
-            End If
-
-            Dim width = Integer.Parse(parts(1), CultureInfo.InvariantCulture)
-            Dim height = Integer.Parse(parts(2), CultureInfo.InvariantCulture)
-            Dim format = parts(3)
-            If width <> 160 OrElse height <> 160 OrElse Not format.Equals("RGB565BE", StringComparison.Ordinal) Then
-                Throw New InvalidDataException($"unsupported snapshot format: {header}")
-            End If
-
-            Dim pixelBytes = ReadExact(port, width * height * 2, timeoutMs)
-            Dim endLine = ReadLineSkippingEmpty(port, timeoutMs)
-            If Not endLine.Equals("PALM_LCD_SNAPSHOT_END", StringComparison.Ordinal) Then
-                Throw New InvalidDataException($"snapshot end marker missing: {endLine}")
-            End If
-
-            WriteScaledRgb565Bmp(outputPath, pixelBytes, width, height, scale)
-            Console.WriteLine($"Snapshot saved: {outputPath}")
-            Console.WriteLine($"Source: {width}x{height} {format}; output: {width * scale}x{height * scale} BMP")
+            CaptureSnapshotFromOpenPort(port, outputPath, timeoutMs, scale)
         End Using
 
         Return 0
     End Function
+
+    Private Function CaptureTapSnapshot(args As String()) As Integer
+        If args.Length < 4 Then
+            PrintUsage()
+            Return 2
+        End If
+
+        Dim portName = args(1)
+        Dim x = Integer.Parse(args(2), CultureInfo.InvariantCulture)
+        Dim y = Integer.Parse(args(3), CultureInfo.InvariantCulture)
+        If x < 0 OrElse x >= 160 OrElse y < 0 OrElse y >= 160 Then
+            Throw New ArgumentOutOfRangeException("tap-snapshot", "tap coordinates must be inside the Palm LCD area: 0 <= x,y < 160")
+        End If
+
+        Dim outputPath = Path.GetFullPath(If(args.Length >= 5 AndAlso Not args(4).StartsWith("--", StringComparison.Ordinal), args(4), "palm-lcd-tap-snapshot.bmp"))
+        Dim baud = Integer.Parse(GetOptionValue(args, "--baud", "115200"), CultureInfo.InvariantCulture)
+        Dim timeoutMs = Integer.Parse(GetOptionValue(args, "--timeout-ms", "10000"), CultureInfo.InvariantCulture)
+        Dim scale = Integer.Parse(GetOptionValue(args, "--scale", "3"), CultureInfo.InvariantCulture)
+        If scale < 1 Then
+            Throw New ArgumentOutOfRangeException(NameOf(scale), "scale must be >= 1")
+        End If
+
+        Using port As New SerialPort(portName, baud, Parity.None, 8, StopBits.One)
+            port.Encoding = Encoding.ASCII
+            port.ReadTimeout = 250
+            port.WriteTimeout = 1000
+            port.DtrEnable = False
+            port.RtsEnable = False
+            port.Open()
+            port.DiscardInBuffer()
+            port.DiscardOutBuffer()
+            port.Write($"tap {x} {y}" & vbLf)
+
+            Dim line = ReadUntilTapResponse(port, timeoutMs)
+            Console.WriteLine(line)
+            CaptureSnapshotFromOpenPort(port, outputPath, timeoutMs, scale)
+        End Using
+
+        Return 0
+    End Function
+
+    Private Sub CaptureSnapshotFromOpenPort(port As SerialPort, outputPath As String, timeoutMs As Integer, scale As Integer)
+        port.Write("lcdsnap" & vbLf)
+
+        Dim header = ReadUntilSnapshotHeader(port, timeoutMs)
+        Dim parts = header.Split(" "c, StringSplitOptions.RemoveEmptyEntries)
+        If parts.Length < 5 OrElse Not parts(0).Equals("PALM_LCD_SNAPSHOT_BEGIN", StringComparison.Ordinal) Then
+            Throw New InvalidDataException($"unexpected snapshot header: {header}")
+        End If
+
+        Dim width = Integer.Parse(parts(1), CultureInfo.InvariantCulture)
+        Dim height = Integer.Parse(parts(2), CultureInfo.InvariantCulture)
+        Dim format = parts(3)
+        If width <> 160 OrElse height <> 160 OrElse Not format.Equals("RGB565BE", StringComparison.Ordinal) Then
+            Throw New InvalidDataException($"unsupported snapshot format: {header}")
+        End If
+
+        Dim pixelBytes = ReadExact(port, width * height * 2, timeoutMs)
+        Dim endLine = ReadLineSkippingEmpty(port, timeoutMs)
+        If Not endLine.Equals("PALM_LCD_SNAPSHOT_END", StringComparison.Ordinal) Then
+            Throw New InvalidDataException($"snapshot end marker missing: {endLine}")
+        End If
+
+        WriteScaledRgb565Bmp(outputPath, pixelBytes, width, height, scale)
+        Console.WriteLine($"Snapshot saved: {outputPath}")
+        Console.WriteLine($"Source: {width}x{height} {format}; output: {width * scale}x{height * scale} BMP")
+    End Sub
 
     Private Function SendTap(args As String()) As Integer
         If args.Length < 4 Then
@@ -657,6 +703,7 @@ Module Program
         Console.WriteLine("  PalmEsp32RomTool inspect <rom-file> [--rom-base 0x10C00000]")
         Console.WriteLine("  PalmEsp32RomTool generate <rom-file> <output-dir> [--all] [--app-name ""Memo Pad""] [--creator memo] [--project-name PalmCompatGenerated] [--hardware-profile esp32-palm-m100] [--rom-base 0x10C00000]")
         Console.WriteLine("  PalmEsp32RomTool snapshot <port> [output.bmp] [--baud 115200] [--scale 3] [--timeout-ms 10000]")
+        Console.WriteLine("  PalmEsp32RomTool tap-snapshot <port> <x> <y> [output.bmp] [--baud 115200] [--scale 3] [--timeout-ms 10000]")
         Console.WriteLine("  PalmEsp32RomTool tap <port> <x> <y> [--baud 115200] [--timeout-ms 5000]")
         Console.WriteLine("  PalmEsp32RomTool text <port> <memo text> [--baud 115200] [--timeout-ms 5000]")
         Console.WriteLine("  PalmEsp32RomTool trap-map [--markdown]")
@@ -666,6 +713,7 @@ Module Program
         Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- generate Palm-m100-3.51-en.rom out/PalmCompat --all")
         Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- generate Palm-m100-3.51-en.rom out/MemoPad --app-name ""Memo Pad""")
         Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- snapshot COM4 out/palm-lcd.bmp")
+        Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- tap-snapshot COM4 130 12 out/category-popup.bmp")
         Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- tap COM4 24 92")
         Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- text COM4 ""New memo from UART""")
         Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- trap-map --markdown")
