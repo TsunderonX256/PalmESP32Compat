@@ -1026,7 +1026,8 @@ static constexpr uint32_t kFakeFormHandleBase = 0x00040000u;
 static constexpr uint32_t kFakeDisplayWindowHandle = 0x00050000u;
 static constexpr uint32_t kFakeSavedBitsWindowHandle = 0x00050010u;
 static constexpr uint8_t kFakeFormObjectCapacity = 20u;
-static constexpr uint32_t kFakeFormObjectRecordSize = 32u;
+static constexpr uint32_t kFakeFormObjectRecordSize = 48u;
+static constexpr uint16_t kFakeFormSyntheticObjectBase = 0xF000u;
 static constexpr uint8_t kFakeTableCapacity = 4u;
 static constexpr uint8_t kFakeTableMaxRows = 12u;
 static constexpr uint8_t kFakeTableMaxColumns = 4u;
@@ -1111,6 +1112,12 @@ struct FakePalmFormObject
     bool enabled;
     bool usable;
     bool visible;
+    uint8_t resourceType;
+    uint8_t formObjectIndex;
+    uint16_t objectFlags;
+    uint16_t style;
+    uint16_t group;
+    uint16_t fontId;
     int16_t tableRows;
     int16_t tableColumns;
     int16_t scrollValue;
@@ -1948,6 +1955,25 @@ static bool fakeObjectIsScrollBar(FakePalmFormObject* object)
     return object != nullptr && (object->kind == 13u || object->objectId == kPalmMemoScrollbarId);
 }
 
+static void fakeFormSyncCommonMemory(FakePalmFormObject& object)
+{
+    object.objectFlags = static_cast<uint16_t>((object.enabled ? 1u : 0u) |
+        (object.usable ? 2u : 0u) |
+        (object.visible ? 4u : 0u));
+    writeWordIfPointer(object.ptr + 24u, object.popupControlId);
+    writeWordIfPointer(object.ptr + 26u, object.popupListId);
+    writeWordIfPointer(object.ptr + 28u, object.linkedObjectId);
+    writeWordIfPointer(object.ptr + 30u, static_cast<uint16_t>(object.resourceType));
+    writeWordIfPointer(object.ptr + 32u, static_cast<uint16_t>(object.formObjectIndex));
+    writeWordIfPointer(object.ptr + 34u, object.objectFlags);
+    writeWordIfPointer(object.ptr + 36u, static_cast<uint16_t>(object.tableRows));
+    writeWordIfPointer(object.ptr + 38u, static_cast<uint16_t>(object.tableColumns));
+    writeWordIfPointer(object.ptr + 40u, static_cast<uint16_t>(object.scrollPageSize));
+    writeWordIfPointer(object.ptr + 42u, object.style);
+    writeWordIfPointer(object.ptr + 44u, object.group);
+    writeWordIfPointer(object.ptr + 46u, object.fontId);
+}
+
 static void fakeControlSyncMemory(FakePalmFormObject& object)
 {
     writeWordIfPointer(object.ptr + 0u, object.objectId);
@@ -1957,9 +1983,7 @@ static void fakeControlSyncMemory(FakePalmFormObject& object)
     writeWordIfPointer(object.ptr + 8u, static_cast<uint16_t>(object.w));
     writeWordIfPointer(object.ptr + 10u, static_cast<uint16_t>(object.h));
     writeCString(object.ptr + 12u, object.label, 12u);
-    writeWordIfPointer(object.ptr + 24u, object.popupControlId);
-    writeWordIfPointer(object.ptr + 26u, object.popupListId);
-    writeWordIfPointer(object.ptr + 28u, object.linkedObjectId);
+    fakeFormSyncCommonMemory(object);
 }
 
 static void fakeScrollBarSyncMemory(FakePalmFormObject& object)
@@ -1974,9 +1998,7 @@ static void fakeScrollBarSyncMemory(FakePalmFormObject& object)
     writeWordIfPointer(object.ptr + 14u, static_cast<uint16_t>(object.scrollMin));
     writeWordIfPointer(object.ptr + 16u, static_cast<uint16_t>(object.scrollMax));
     writeWordIfPointer(object.ptr + 18u, static_cast<uint16_t>(object.scrollPageSize));
-    writeWordIfPointer(object.ptr + 24u, object.popupControlId);
-    writeWordIfPointer(object.ptr + 26u, object.popupListId);
-    writeWordIfPointer(object.ptr + 28u, object.linkedObjectId);
+    fakeFormSyncCommonMemory(object);
 }
 
 static FakePalmFormObject* fakeScrollBarForPtr(uint32_t scrollBarP)
@@ -2100,7 +2122,7 @@ static void fakeFormResetObjects()
     fakeTableReset();
 }
 
-static uint16_t fakeFormAddObjectExplicit(uint16_t objectId, uint16_t kind, int16_t x, int16_t y, int16_t w, int16_t h, int16_t tableRows, int16_t tableColumns, const char* label)
+static uint16_t fakeFormAddObjectExplicit(uint16_t objectId, uint16_t kind, int16_t x, int16_t y, int16_t w, int16_t h, int16_t tableRows, int16_t tableColumns, const char* label, uint8_t formObjectIndex = 0xffu, uint16_t style = 0u, uint16_t group = 0u, uint16_t fontId = 0u)
 {
     for (uint8_t i = 0; i < gFakeFormObjectCount; ++i)
     {
@@ -2125,6 +2147,12 @@ static uint16_t fakeFormAddObjectExplicit(uint16_t objectId, uint16_t kind, int1
     object.enabled = true;
     object.usable = true;
     object.visible = true;
+    object.resourceType = static_cast<uint8_t>(kind);
+    object.formObjectIndex = formObjectIndex;
+    object.objectFlags = 0;
+    object.style = style;
+    object.group = group;
+    object.fontId = fontId;
     object.resourceOffset = 0;
     object.popupControlId = 0;
     object.popupListId = 0;
@@ -2231,7 +2259,33 @@ static bool fakeFormReadResourceLabel(const PalmGeneratedOverlayResource& resour
     return false;
 }
 
-static bool fakeFormDecodeObjectBounds(const PalmGeneratedOverlayResource& resource, uint8_t objectType, uint32_t objectOffset, uint16_t& objectId, int16_t& x, int16_t& y, int16_t& w, int16_t& h, int16_t& tableRows, int16_t& tableColumns, char* label, size_t labelSize)
+static int16_t fakeFormEstimatedLabelWidth(const char* label)
+{
+    if (label == nullptr || label[0] == '\0')
+    {
+        return 8;
+    }
+
+    const size_t length = strlen(label);
+    int width = static_cast<int>(length) * 6 + 2;
+    if (width < 8)
+    {
+        width = 8;
+    }
+    if (width > 160)
+    {
+        width = 160;
+    }
+    return static_cast<int16_t>(width);
+}
+
+static bool fakeFormBoundsPlausible(uint16_t objectId, int16_t x, int16_t y, int16_t w, int16_t h, bool allowZeroHeight)
+{
+    return objectId != 0xffffu && x >= 0 && y >= 0 && w > 0 && (allowZeroHeight ? h >= 0 : h > 0) &&
+        x <= 319 && y <= 319 && w <= 320 && h <= 320;
+}
+
+static bool fakeFormDecodeObjectBounds(const PalmGeneratedOverlayResource& resource, uint8_t objectType, uint32_t objectOffset, uint16_t& objectId, int16_t& x, int16_t& y, int16_t& w, int16_t& h, int16_t& tableRows, int16_t& tableColumns, uint16_t& style, uint16_t& group, uint16_t& fontId, char* label, size_t labelSize)
 {
     if (resource.bytes == nullptr || objectOffset + 10u > resource.size)
     {
@@ -2245,6 +2299,9 @@ static bool fakeFormDecodeObjectBounds(const PalmGeneratedOverlayResource& resou
     h = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 8u));
     tableRows = 0;
     tableColumns = 0;
+    style = 0;
+    group = 0;
+    fontId = 0;
     if (label != nullptr && labelSize > 0)
     {
         label[0] = '\0';
@@ -2273,21 +2330,66 @@ static bool fakeFormDecodeObjectBounds(const PalmGeneratedOverlayResource& resou
         w = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 4u));
         h = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 6u));
         objectId = readOverlayU16BE(resource, objectOffset + 8u);
-        return objectId != 0u && objectId != 0xffffu && x >= 0 && y >= 0 && w > 0 && h > 0 && x <= 159 && y <= 159;
+        return objectId != 0u && fakeFormBoundsPlausible(objectId, x, y, w, h, false);
     }
 
     if (objectType == 2u)
     {
-        return objectId != 0u && objectId != 0xffffu && x >= 0 && y >= 0 && w > 0 && h >= 0 && x <= 159 && y <= 159 && w <= 200 && h <= 200;
+        return objectId != 0u && fakeFormBoundsPlausible(objectId, x, y, w, h, true);
     }
 
-    if (objectId == 0 || objectId == 0xffffu || x < 0 || y < 0 || w <= 0 || h <= 0 || x > 159 || y > 159 || w > 200 || h > 200)
+    if (objectType == 5u && objectOffset + 8u <= resource.size)
+    {
+        const int16_t x1 = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 0u));
+        const int16_t y1 = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 2u));
+        const int16_t x2 = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 4u));
+        const int16_t y2 = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 6u));
+        x = x1 < x2 ? x1 : x2;
+        y = y1 < y2 ? y1 : y2;
+        w = static_cast<int16_t>((x1 > x2 ? x1 - x2 : x2 - x1) + 1);
+        h = static_cast<int16_t>((y1 > y2 ? y1 - y2 : y2 - y1) + 1);
+        objectId = 0;
+        return fakeFormBoundsPlausible(0u, x, y, w, h, false);
+    }
+
+    if ((objectType == 6u || objectType == 7u) && objectOffset + 8u <= resource.size)
+    {
+        x = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 0u));
+        y = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 2u));
+        w = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 4u));
+        h = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 6u));
+        objectId = 0;
+        return fakeFormBoundsPlausible(0u, x, y, w, h, false);
+    }
+
+    if (objectType == 8u)
+    {
+        fakeFormReadResourceLabel(resource, objectOffset + 6u, 48u, label, labelSize);
+        objectId = readOverlayU16BE(resource, objectOffset + 0u);
+        x = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 2u));
+        y = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 4u));
+        w = fakeFormEstimatedLabelWidth(label);
+        h = 11;
+        if (objectOffset + 6u <= resource.size)
+        {
+            fontId = readOverlayU16BE(resource, objectOffset + 6u);
+        }
+        return label != nullptr && label[0] != '\0' && fakeFormBoundsPlausible(objectId, x, y, w, h, false);
+    }
+
+    if (!fakeFormBoundsPlausible(objectId, x, y, w, h, false) || (objectId == 0 && objectType != 11u))
     {
         return false;
     }
 
     if (objectType == 1u)
     {
+        if (objectOffset + 16u <= resource.size)
+        {
+            style = resource.bytes[objectOffset + 10u];
+            group = resource.bytes[objectOffset + 11u];
+            fontId = resource.bytes[objectOffset + 12u];
+        }
         fakeFormReadResourceLabel(resource, objectOffset + 10u, 32u, label, labelSize);
     }
     else if (objectType == 3u && objectOffset + 16u <= resource.size)
@@ -2311,11 +2413,19 @@ static bool fakeFormKnownObjectType(uint8_t objectType)
 {
     switch (objectType)
     {
+        case 0u:
         case 1u:
         case 2u:
         case 3u:
+        case 4u:
+        case 5u:
+        case 6u:
+        case 7u:
+        case 8u:
         case 9u:
         case 10u:
+        case 11u:
+        case 12u:
         case 13u:
             return true;
         default:
@@ -2348,6 +2458,9 @@ static uint8_t fakeFormScoreObjectList(const PalmGeneratedOverlayResource& resou
         int16_t h = 0;
         int16_t tableRows = 0;
         int16_t tableColumns = 0;
+        uint16_t style = 0;
+        uint16_t group = 0;
+        uint16_t fontId = 0;
         char label[16] = """";
         uint16_t popupControlId = 0;
         uint16_t popupListId = 0;
@@ -2355,7 +2468,7 @@ static uint8_t fakeFormScoreObjectList(const PalmGeneratedOverlayResource& resou
         {
             ++score;
         }
-        else if (fakeFormDecodeObjectBounds(resource, objectType, objectOffset, objectId, x, y, w, h, tableRows, tableColumns, label, sizeof(label)))
+        else if (fakeFormDecodeObjectBounds(resource, objectType, objectOffset, objectId, x, y, w, h, tableRows, tableColumns, style, group, fontId, label, sizeof(label)))
         {
             ++score;
         }
@@ -2419,8 +2532,11 @@ static bool fakeFormDecodeFromResource(const PalmGeneratedOverlayResource& resou
         int16_t h = 0;
         int16_t tableRows = 0;
         int16_t tableColumns = 0;
+        uint16_t style = 0;
+        uint16_t group = 0;
+        uint16_t fontId = 0;
         char label[24] = """";
-        if (!fakeFormDecodeObjectBounds(resource, objectType, objectOffset, objectId, x, y, w, h, tableRows, tableColumns, label, sizeof(label)))
+        if (!fakeFormDecodeObjectBounds(resource, objectType, objectOffset, objectId, x, y, w, h, tableRows, tableColumns, style, group, fontId, label, sizeof(label)))
         {
             uint16_t popupControlId = 0;
             uint16_t popupListId = 0;
@@ -2443,13 +2559,25 @@ static bool fakeFormDecodeFromResource(const PalmGeneratedOverlayResource& resou
             continue;
         }
 
-        const uint16_t objectIndex = fakeFormAddObjectExplicit(objectId, objectType, x, y, w, h, tableRows, tableColumns, label);
+        if (objectId == 0u)
+        {
+            objectId = static_cast<uint16_t>(kFakeFormSyntheticObjectBase + i);
+        }
+        const uint16_t objectIndex = fakeFormAddObjectExplicit(objectId, objectType, x, y, w, h, tableRows, tableColumns, label, static_cast<uint8_t>(i), style, group, fontId);
         if (objectIndex != 0xffffu)
         {
             gFakeFormObjects[objectIndex].resourceOffset = objectOffset;
+            if (objectType == 13u && objectOffset + 18u <= resource.size)
+            {
+                gFakeFormObjects[objectIndex].scrollValue = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 10u));
+                gFakeFormObjects[objectIndex].scrollMin = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 12u));
+                gFakeFormObjects[objectIndex].scrollMax = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 14u));
+                gFakeFormObjects[objectIndex].scrollPageSize = static_cast<int16_t>(readOverlayU16BE(resource, objectOffset + 16u));
+                fakeScrollBarSyncMemory(gFakeFormObjects[objectIndex]);
+            }
             fakeFormRefreshPopupMetadataLinks();
             ++decodedCount;
-            Serial.printf(""    tFRM object %u type=%u id=%u bounds=%d,%d,%d,%d link=%u label='%s'\n"",
+            Serial.printf(""    tFRM object %u type=%u id=%u bounds=%d,%d,%d,%d link=%u style=%u group=%u font=%u label='%s'\n"",
                 static_cast<unsigned>(i),
                 static_cast<unsigned>(objectType),
                 static_cast<unsigned>(objectId),
@@ -2458,6 +2586,9 @@ static bool fakeFormDecodeFromResource(const PalmGeneratedOverlayResource& resou
                 static_cast<int>(w),
                 static_cast<int>(h),
                 static_cast<unsigned>(gFakeFormObjects[objectIndex].linkedObjectId),
+                static_cast<unsigned>(style),
+                static_cast<unsigned>(group),
+                static_cast<unsigned>(fontId),
                 label);
         }
     }
@@ -9937,6 +10068,40 @@ static void drawPalmPopupArrow(int x, int y, uint16_t color)
     fillPalmRect(x + 2, y + 2, 1, 1, color);
 }
 
+static int palmTextWidth(const char* text);
+static void drawPalmTextClipped(int x, int y, const char* text, uint16_t color, int scale, int maxWidth);
+
+static void drawPalmTitleTab(int x, int y, const char* title, uint16_t bg, uint16_t ink)
+{
+    const char* displayTitle = title != nullptr && title[0] != '\0' ? title : ""Memo List"";
+    int width = palmTextWidth(displayTitle) + 10;
+    if (width < 46)
+    {
+        width = 46;
+    }
+    if (width > 118)
+    {
+        width = 118;
+    }
+
+    fillPalmRect(x, y, width, 15, ink);
+    drawPalmTextClipped(x + 4, y + 4, displayTitle, bg, 1, width - 8);
+    fillPalmRect(x + width, y + 14, 160 - width, 1, ink);
+}
+
+static void drawPalmCategoryHeader(int x, int y, int w, int h, const char* text, uint16_t ink)
+{
+    if (w <= 0 || h <= 0)
+    {
+        return;
+    }
+
+    const int arrowX = x + 1;
+    const int arrowY = y + ((h - 3) / 2);
+    drawPalmPopupArrow(arrowX, arrowY, ink);
+    drawPalmTextClipped(arrowX + 9, y + ((h - 8) / 2), text, ink, 1, w - 10);
+}
+
 static bool palmRealFontContains(char ch)
 {
     if (!gPalmRealFont.valid)
@@ -11104,16 +11269,15 @@ static void renderMemoPadUiSurface(uint16_t selector, uint32_t trapCount)
 
     fillPalmRect(0, 0, 160, 160, lcdBg);
 
-    fillPalmRect(0, 15, 160, 1, lcdInk);
-    drawPalmTextClipped(4, 4, gPalmUiTitle, lcdInk, 1, gPalmUiCategoryVisible ? 92 : 148);
-
-    if (gPalmUiCategoryVisible)
-    {
-        drawPalmPopupSelector(gPalmUiCategoryBounds.x, gPalmUiCategoryBounds.y, gPalmUiCategoryBounds.w, gPalmUiCategoryBounds.h, gPalmUiCategory, lcdBg, lcdInk, line);
-    }
-
     if (gPalmUiMode == kPalmUiModeEdit)
     {
+        fillPalmRect(0, 15, 160, 1, lcdInk);
+        drawPalmTextClipped(4, 4, gPalmUiTitle, lcdInk, 1, gPalmUiCategoryVisible ? 92 : 148);
+        if (gPalmUiCategoryVisible)
+        {
+            drawPalmPopupSelector(gPalmUiCategoryBounds.x, gPalmUiCategoryBounds.y, gPalmUiCategoryBounds.w, gPalmUiCategoryBounds.h, gPalmUiCategory, lcdBg, lcdInk, line);
+        }
+
         const PalmUiObjectBounds doneButton = palmUiObjectBounds(kMemoDoneButtonId);
         const PalmUiObjectBounds cancelButton = palmUiObjectBounds(kMemoCancelButtonId);
         drawPalmTextClipped(4, 21, ""New Memo"", lcdInk, 1, 120);
@@ -11133,23 +11297,20 @@ static void renderMemoPadUiSurface(uint16_t selector, uint32_t trapCount)
         return;
     }
 
+    const char* listTitle = strcmp(gPalmUiTitle, ""Memo"") == 0 ? ""Memo List"" : gPalmUiTitle;
+    drawPalmTitleTab(0, 0, listTitle, lcdBg, lcdInk);
+    if (gPalmUiCategoryVisible)
+    {
+        drawPalmCategoryHeader(gPalmUiCategoryBounds.x, gPalmUiCategoryBounds.y, gPalmUiCategoryBounds.w, gPalmUiCategoryBounds.h, gPalmUiCategory, lcdInk);
+    }
+
     const int visibleRows = palmUiMemoVisibleRows();
     const int rowHeight = palmUiMemoRowHeight();
     const PalmUiObjectBounds listBounds = palmUiObjectBounds(kMemoListId);
     const int scrollX = listBounds.x + listBounds.w;
     const int tableW = scrollX < 159 ? listBounds.w : listBounds.w - 7;
     fillPalmRect(listBounds.x, listBounds.y, tableW, listBounds.h, lcdBg);
-    drawPalmRectOutline(listBounds.x, listBounds.y, tableW, listBounds.h, lcdInk);
     drawPalmScrollbar(scrollX, listBounds.y, listBounds.h, gPalmUiListCount, gPalmUiTopRow, visibleRows, chromeLight, lcdInk, line);
-
-    for (int row = 1; row < visibleRows; ++row)
-    {
-        const int y = listBounds.y + row * rowHeight;
-        if (y < listBounds.y + listBounds.h)
-        {
-            fillPalmRect(listBounds.x + 1, y, tableW - 2, 1, line);
-        }
-    }
 
     if (!gPalmUiNativeRowsSuppressed && gPalmUiListCount == 0 && gPalmUiRows[0][0] == '\0' && gPalmUiMemo[0] == '\0')
     {
@@ -11164,7 +11325,7 @@ static void renderMemoPadUiSurface(uint16_t selector, uint32_t trapCount)
             const bool selected = gPalmUiSelectedRow == recordIndex;
             if (selected)
             {
-                fillPalmRect(listBounds.x + 1, listBounds.y + 1 + row * rowHeight, tableW - 2, rowHeight - 1, selectedFill);
+                fillPalmRect(listBounds.x, listBounds.y + row * rowHeight, tableW, rowHeight, selectedFill);
             }
             drawPalmTextClipped(listBounds.x + 4, listBounds.y + 2 + row * rowHeight, gPalmUiRows[row], selected ? lcdBg : lcdInk, 1, tableW - 8);
         }

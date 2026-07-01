@@ -1,6 +1,7 @@
 Imports System.Globalization
 Imports System.IO
 Imports System.IO.Ports
+Imports System.Net.Sockets
 Imports System.Text
 
 Module Program
@@ -22,6 +23,10 @@ Module Program
                     Return CaptureSnapshot(args)
                 Case "tap-snapshot"
                     Return CaptureTapSnapshot(args)
+                Case "snapshot-tcp"
+                    Return CaptureSnapshotTcp(args)
+                Case "tap-snapshot-tcp"
+                    Return CaptureTapSnapshotTcp(args)
                 Case "tap"
                     Return SendTap(args)
                 Case "text"
@@ -109,6 +114,82 @@ Module Program
         Return 0
     End Function
 
+    Private Function CaptureSnapshotTcp(args As String()) As Integer
+        If args.Length < 3 Then
+            PrintUsage()
+            Return 2
+        End If
+
+        Dim host = args(1)
+        Dim portNumber = Integer.Parse(args(2), CultureInfo.InvariantCulture)
+        Dim outputPath = Path.GetFullPath(If(args.Length >= 4 AndAlso Not args(3).StartsWith("--", StringComparison.Ordinal), args(3), "palm-lcd-snapshot.bmp"))
+        Dim timeoutMs = Integer.Parse(GetOptionValue(args, "--timeout-ms", "15000"), CultureInfo.InvariantCulture)
+        Dim connectWaitMs = Integer.Parse(GetOptionValue(args, "--connect-wait-ms", "0"), CultureInfo.InvariantCulture)
+        Dim scale = Integer.Parse(GetOptionValue(args, "--scale", "3"), CultureInfo.InvariantCulture)
+        If connectWaitMs < 0 Then
+            Throw New ArgumentOutOfRangeException(NameOf(connectWaitMs), "connect wait must be >= 0")
+        End If
+        If scale < 1 Then
+            Throw New ArgumentOutOfRangeException(NameOf(scale), "scale must be >= 1")
+        End If
+
+        Using client = ConnectTcpCommandChannel(host, portNumber, timeoutMs)
+            Using stream = client.GetStream()
+                stream.ReadTimeout = 250
+                stream.WriteTimeout = 1000
+                If connectWaitMs > 0 Then
+                    DrainTcpStream(stream, connectWaitMs)
+                End If
+                CaptureSnapshotFromOpenTcpStream(stream, outputPath, timeoutMs, scale)
+            End Using
+        End Using
+
+        Return 0
+    End Function
+
+    Private Function CaptureTapSnapshotTcp(args As String()) As Integer
+        If args.Length < 5 Then
+            PrintUsage()
+            Return 2
+        End If
+
+        Dim host = args(1)
+        Dim portNumber = Integer.Parse(args(2), CultureInfo.InvariantCulture)
+        Dim x = Integer.Parse(args(3), CultureInfo.InvariantCulture)
+        Dim y = Integer.Parse(args(4), CultureInfo.InvariantCulture)
+        If x < 0 OrElse x >= 160 OrElse y < 0 OrElse y >= 160 Then
+            Throw New ArgumentOutOfRangeException("tap-snapshot-tcp", "tap coordinates must be inside the Palm LCD area: 0 <= x,y < 160")
+        End If
+
+        Dim outputPath = Path.GetFullPath(If(args.Length >= 6 AndAlso Not args(5).StartsWith("--", StringComparison.Ordinal), args(5), "palm-lcd-tap-snapshot.bmp"))
+        Dim timeoutMs = Integer.Parse(GetOptionValue(args, "--timeout-ms", "15000"), CultureInfo.InvariantCulture)
+        Dim connectWaitMs = Integer.Parse(GetOptionValue(args, "--connect-wait-ms", "0"), CultureInfo.InvariantCulture)
+        Dim scale = Integer.Parse(GetOptionValue(args, "--scale", "3"), CultureInfo.InvariantCulture)
+        If connectWaitMs < 0 Then
+            Throw New ArgumentOutOfRangeException(NameOf(connectWaitMs), "connect wait must be >= 0")
+        End If
+        If scale < 1 Then
+            Throw New ArgumentOutOfRangeException(NameOf(scale), "scale must be >= 1")
+        End If
+
+        Using client = ConnectTcpCommandChannel(host, portNumber, timeoutMs)
+            Using stream = client.GetStream()
+                stream.ReadTimeout = 250
+                stream.WriteTimeout = 1000
+                If connectWaitMs > 0 Then
+                    DrainTcpStream(stream, connectWaitMs)
+                End If
+                WriteAsciiLine(stream, $"tap {x} {y}")
+
+                Dim line = ReadUntilTapResponse(stream, timeoutMs)
+                Console.WriteLine(line)
+                CaptureSnapshotFromOpenTcpStream(stream, outputPath, timeoutMs, scale)
+            End Using
+        End Using
+
+        Return 0
+    End Function
+
     Private Sub CaptureSnapshotFromOpenPort(port As SerialPort, outputPath As String, timeoutMs As Integer, scale As Integer)
         port.Write("lcdsnap" & vbLf)
 
@@ -127,6 +208,33 @@ Module Program
 
         Dim pixelBytes = ReadExact(port, width * height * 2, timeoutMs)
         Dim endLine = ReadLineSkippingEmpty(port, timeoutMs)
+        If Not endLine.Equals("PALM_LCD_SNAPSHOT_END", StringComparison.Ordinal) Then
+            Throw New InvalidDataException($"snapshot end marker missing: {endLine}")
+        End If
+
+        WriteScaledRgb565Bmp(outputPath, pixelBytes, width, height, scale)
+        Console.WriteLine($"Snapshot saved: {outputPath}")
+        Console.WriteLine($"Source: {width}x{height} {format}; output: {width * scale}x{height * scale} BMP")
+    End Sub
+
+    Private Sub CaptureSnapshotFromOpenTcpStream(stream As NetworkStream, outputPath As String, timeoutMs As Integer, scale As Integer)
+        WriteAsciiLine(stream, "lcdsnap")
+
+        Dim header = ReadUntilSnapshotHeader(stream, timeoutMs)
+        Dim parts = header.Split(" "c, StringSplitOptions.RemoveEmptyEntries)
+        If parts.Length < 5 OrElse Not parts(0).Equals("PALM_LCD_SNAPSHOT_BEGIN", StringComparison.Ordinal) Then
+            Throw New InvalidDataException($"unexpected snapshot header: {header}")
+        End If
+
+        Dim width = Integer.Parse(parts(1), CultureInfo.InvariantCulture)
+        Dim height = Integer.Parse(parts(2), CultureInfo.InvariantCulture)
+        Dim format = parts(3)
+        If width <> 160 OrElse height <> 160 OrElse Not format.Equals("RGB565BE", StringComparison.Ordinal) Then
+            Throw New InvalidDataException($"unsupported snapshot format: {header}")
+        End If
+
+        Dim pixelBytes = ReadExact(stream, width * height * 2, timeoutMs)
+        Dim endLine = ReadLineSkippingEmpty(stream, timeoutMs)
         If Not endLine.Equals("PALM_LCD_SNAPSHOT_END", StringComparison.Ordinal) Then
             Throw New InvalidDataException($"snapshot end marker missing: {endLine}")
         End If
@@ -528,6 +636,46 @@ Module Program
         Return value = "-h" OrElse value = "--help" OrElse value = "/?"
     End Function
 
+    Private Function ConnectTcpCommandChannel(host As String, portNumber As Integer, timeoutMs As Integer) As TcpClient
+        Dim client As New TcpClient()
+        Dim connectTask = client.ConnectAsync(host, portNumber)
+        Try
+            If Not connectTask.Wait(timeoutMs) Then
+                client.Dispose()
+                Throw New TimeoutException($"timed out connecting to {host}:{portNumber}")
+            End If
+        Catch ex As AggregateException
+            client.Dispose()
+            Throw ex.GetBaseException()
+        End Try
+
+        If connectTask.IsFaulted AndAlso connectTask.Exception IsNot Nothing Then
+            client.Dispose()
+            Throw connectTask.Exception.GetBaseException()
+        End If
+
+        Return client
+    End Function
+
+    Private Sub WriteAsciiLine(stream As NetworkStream, value As String)
+        Dim bytes = Encoding.ASCII.GetBytes(value & vbLf)
+        stream.Write(bytes, 0, bytes.Length)
+        stream.Flush()
+    End Sub
+
+    Private Sub DrainTcpStream(stream As NetworkStream, durationMs As Integer)
+        Dim deadline = DateTime.UtcNow.AddMilliseconds(durationMs)
+        Dim buffer(1023) As Byte
+
+        Do While DateTime.UtcNow < deadline
+            If stream.DataAvailable Then
+                stream.Read(buffer, 0, buffer.Length)
+            Else
+                Threading.Thread.Sleep(5)
+            End If
+        Loop
+    End Sub
+
     Private Function ReadUntilSnapshotHeader(port As SerialPort, timeoutMs As Integer) As String
         Dim deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs)
         Do
@@ -543,10 +691,40 @@ Module Program
         Throw New TimeoutException("timed out waiting for PALM_LCD_SNAPSHOT_BEGIN")
     End Function
 
+    Private Function ReadUntilSnapshotHeader(stream As NetworkStream, timeoutMs As Integer) As String
+        Dim deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs)
+        Do
+            Dim line = ReadLineSkippingEmpty(stream, Math.Max(1, CInt((deadline - DateTime.UtcNow).TotalMilliseconds)))
+            If line.StartsWith("PALM_LCD_SNAPSHOT_BEGIN ", StringComparison.Ordinal) Then
+                Return line
+            End If
+            If line.StartsWith("PALM_LCD_SNAPSHOT_ERROR ", StringComparison.Ordinal) Then
+                Throw New IOException(line)
+            End If
+        Loop While DateTime.UtcNow < deadline
+
+        Throw New TimeoutException("timed out waiting for PALM_LCD_SNAPSHOT_BEGIN")
+    End Function
+
     Private Function ReadUntilTapResponse(port As SerialPort, timeoutMs As Integer) As String
         Dim deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs)
         Do
             Dim line = ReadLineSkippingEmpty(port, Math.Max(1, CInt((deadline - DateTime.UtcNow).TotalMilliseconds)))
+            If line.StartsWith("PALM_LCD_TAP_QUEUED ", StringComparison.Ordinal) Then
+                Return line
+            End If
+            If line.StartsWith("PALM_LCD_TAP_ERROR ", StringComparison.Ordinal) Then
+                Throw New IOException(line)
+            End If
+        Loop While DateTime.UtcNow < deadline
+
+        Throw New TimeoutException("timed out waiting for PALM_LCD_TAP response")
+    End Function
+
+    Private Function ReadUntilTapResponse(stream As NetworkStream, timeoutMs As Integer) As String
+        Dim deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs)
+        Do
+            Dim line = ReadLineSkippingEmpty(stream, Math.Max(1, CInt((deadline - DateTime.UtcNow).TotalMilliseconds)))
             If line.StartsWith("PALM_LCD_TAP_QUEUED ", StringComparison.Ordinal) Then
                 Return line
             End If
@@ -606,6 +784,38 @@ Module Program
         Throw New TimeoutException("timed out reading serial line")
     End Function
 
+    Private Function ReadLineSkippingEmpty(stream As NetworkStream, timeoutMs As Integer) As String
+        Dim deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs)
+        Dim bytes As New List(Of Byte)()
+
+        Do
+            If Not stream.DataAvailable Then
+                Threading.Thread.Sleep(5)
+                Continue Do
+            End If
+
+            Dim value = stream.ReadByte()
+            If value < 0 Then
+                Continue Do
+            End If
+
+            If value = AscW(ControlChars.Lf) Then
+                Dim line = Encoding.ASCII.GetString(bytes.ToArray()).Trim(ControlChars.Cr, ControlChars.Lf)
+                bytes.Clear()
+                If line.Length > 0 Then
+                    Return line
+                End If
+            Else
+                bytes.Add(CByte(value))
+                If bytes.Count > 512 Then
+                    bytes.RemoveAt(0)
+                End If
+            End If
+        Loop While DateTime.UtcNow < deadline
+
+        Throw New TimeoutException("timed out reading TCP command line")
+    End Function
+
     Private Function ReadExact(port As SerialPort, byteCount As Integer, timeoutMs As Integer) As Byte()
         Dim buffer(byteCount - 1) As Byte
         Dim offset = 0
@@ -622,6 +832,29 @@ Module Program
                     Throw New TimeoutException($"timed out reading snapshot bytes: {offset}/{byteCount}")
                 End If
             End Try
+        Loop
+
+        Return buffer
+    End Function
+
+    Private Function ReadExact(stream As NetworkStream, byteCount As Integer, timeoutMs As Integer) As Byte()
+        Dim buffer(byteCount - 1) As Byte
+        Dim offset = 0
+        Dim deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs)
+
+        Do While offset < byteCount
+            If Not stream.DataAvailable Then
+                Threading.Thread.Sleep(2)
+                If DateTime.UtcNow >= deadline Then
+                    Throw New TimeoutException($"timed out reading snapshot bytes: {offset}/{byteCount}")
+                End If
+                Continue Do
+            End If
+
+            Dim read = stream.Read(buffer, offset, byteCount - offset)
+            If read > 0 Then
+                offset += read
+            End If
         Loop
 
         Return buffer
@@ -704,6 +937,8 @@ Module Program
         Console.WriteLine("  PalmEsp32RomTool generate <rom-file> <output-dir> [--all] [--app-name ""Memo Pad""] [--creator memo] [--project-name PalmCompatGenerated] [--hardware-profile esp32-palm-m100] [--rom-base 0x10C00000]")
         Console.WriteLine("  PalmEsp32RomTool snapshot <port> [output.bmp] [--baud 115200] [--scale 3] [--timeout-ms 10000]")
         Console.WriteLine("  PalmEsp32RomTool tap-snapshot <port> <x> <y> [output.bmp] [--baud 115200] [--scale 3] [--timeout-ms 10000]")
+        Console.WriteLine("  PalmEsp32RomTool snapshot-tcp <host> <port> [output.bmp] [--scale 3] [--timeout-ms 15000] [--connect-wait-ms 0]")
+        Console.WriteLine("  PalmEsp32RomTool tap-snapshot-tcp <host> <port> <x> <y> [output.bmp] [--scale 3] [--timeout-ms 15000] [--connect-wait-ms 0]")
         Console.WriteLine("  PalmEsp32RomTool tap <port> <x> <y> [--baud 115200] [--timeout-ms 5000]")
         Console.WriteLine("  PalmEsp32RomTool text <port> <memo text> [--baud 115200] [--timeout-ms 5000]")
         Console.WriteLine("  PalmEsp32RomTool trap-map [--markdown]")
@@ -714,6 +949,8 @@ Module Program
         Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- generate Palm-m100-3.51-en.rom out/MemoPad --app-name ""Memo Pad""")
         Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- snapshot COM4 out/palm-lcd.bmp")
         Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- tap-snapshot COM4 130 12 out/category-popup.bmp")
+        Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- snapshot-tcp 127.0.0.1 5555 out/qemu-lcd.bmp --connect-wait-ms 15000")
+        Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- tap-snapshot-tcp 127.0.0.1 5555 145 6 out/qemu-category-popup.bmp --connect-wait-ms 15000")
         Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- tap COM4 24 92")
         Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- text COM4 ""New memo from UART""")
         Console.WriteLine("  dotnet run --project tools/vbnet/PalmEsp32RomTool -- trap-map --markdown")

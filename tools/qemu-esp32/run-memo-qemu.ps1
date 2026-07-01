@@ -1,6 +1,7 @@
 param(
     [string]$ImagePath = "$(Split-Path -Parent $PSCommandPath)\images\PalmOS4MemoPadSmoke-qemu-headless.bin",
     [int]$Seconds = 0,
+    [int]$SerialTcpPort = 0,
     [switch]$Graphical,
     [switch]$Psram
 )
@@ -33,7 +34,15 @@ if ($Seconds -gt 0) {
     $err = Join-Path $root "qemu-run.err.log"
     Remove-Item -LiteralPath $out, $err -ErrorAction SilentlyContinue
 
-    if ($Graphical) {
+    if ($SerialTcpPort -gt 0) {
+        if (-not $Graphical) {
+            $args += @("-nographic", "-monitor", "none")
+        }
+        $args += @(
+            "-chardev", "socket,id=serial0,host=127.0.0.1,port=$SerialTcpPort,server=on,wait=on",
+            "-serial", "chardev:serial0"
+        )
+    } elseif ($Graphical) {
         $args += @("-display", "sdl", "-serial", "file:qemu-run.out.log")
     } else {
         $args += @("-nographic", "-monitor", "none", "-serial", "file:qemu-run.out.log")
@@ -50,7 +59,15 @@ if ($Seconds -gt 0) {
     Write-Host "--- stderr ---"
     Get-Content -Path $err -ErrorAction SilentlyContinue
 } else {
-    if ($Graphical) {
+    if ($SerialTcpPort -gt 0) {
+        if (-not $Graphical) {
+            $args += @("-nographic", "-monitor", "none")
+        }
+        $args += @(
+            "-chardev", "socket,id=serial0,host=127.0.0.1,port=$SerialTcpPort,server=on,wait=on",
+            "-serial", "chardev:serial0"
+        )
+    } elseif ($Graphical) {
         $args += @("-display", "sdl", "-serial", "stdio")
     } else {
         $args += @("-nographic", "-serial", "stdio")

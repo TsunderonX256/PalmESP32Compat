@@ -22,11 +22,13 @@ This milestone tracks what is still needed before ROM-defined Palm OS UI
 elements are reliably owned by native ESP32 code instead of Memo-specific
 shortcuts.
 
-- Complete `tFRM` object decoding for more Palm form object classes, not only
-  the current Memo Pad controls, list, table, scrollbar, and popup metadata.
+- Complete exact `tFRM` object decoding for each Palm form object class. The
+  bridge now preserves standard object types beyond Memo's core controls, but
+  exact per-class resource layouts still need validation against more apps.
 - Make the native object model match Palm managers more closely for forms,
-  controls, lists, tables, fields, scrollbars, menus, and windows, including
-  pointer/state lifetimes expected by 68K app code.
+  controls, lists, tables, fields, scrollbars, menus, and windows. Fake object
+  records now preserve type/index/flags/style metadata, but full pointer/state
+  lifetimes expected by 68K app code still need broader manager behavior.
 - Make `FrmDispatchEvent`, `FrmHandleEvent`, object handlers, and form callback
   return paths behave more like Palm OS so app handlers drive UI behavior.
 - Improve Palm-style drawing accuracy for control frames, popup/list borders,
@@ -60,6 +62,8 @@ docs/
   trap-map.md      Palm OS trap coverage tracker
   native-esp32-trap-reference.md
                    Native ESP32 trap/function reference for verified shims
+  native-ui-element-tracker.md
+                   Native Palm UI element/resource implementation tracker
 ```
 
 ## VB.NET Converter
@@ -73,6 +77,8 @@ dotnet run --project tools/vbnet/PalmEsp32RomTool -- generate <rom-file> out/Pal
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- trap-map --markdown
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- snapshot COM4 out/palm-lcd.bmp
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- tap-snapshot COM4 145 6 out/category-popup.bmp
+dotnet run --project tools/vbnet/PalmEsp32RomTool -- snapshot-tcp 127.0.0.1 5555 out/qemu-lcd.bmp --connect-wait-ms 15000
+dotnet run --project tools/vbnet/PalmEsp32RomTool -- tap-snapshot-tcp 127.0.0.1 5555 145 6 out/qemu-category-popup.bmp --connect-wait-ms 15000
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- tap COM4 24 92
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- tap COM4 92 148
 dotnet run --project tools/vbnet/PalmEsp32RomTool -- text COM4 "New memo from UART"
@@ -94,11 +100,11 @@ headless native LCD/UI path under ESP32-S3 QEMU.
 
 The Memo Pad smoke path now includes a native ESP32 Palm API shim for the fake
 Memo database, Palm-like UI drawing, 25% default backlight when the LCD is in
-use, a `lcdsnap` UART command that the VB.NET `snapshot` command saves as a
-BMP, a `tap x y` UART command that queues Palm pen events and updates the
-native Memo UI probe, a `tap-snapshot` command for one-session visual checks on
-boards that reset when the serial port opens, and a `text ...` UART command for
-filling the current native edit field. Tapping `Details` opens a first native
+use, a `lcdsnap` UART command that the VB.NET `snapshot` and `snapshot-tcp`
+commands save as a BMP, a `tap x y` UART command that queues Palm pen events
+and updates the native Memo UI probe, `tap-snapshot` and `tap-snapshot-tcp`
+commands for one-session visual checks on boards and QEMU, and a `text ...`
+UART command for filling the current native edit field. Tapping `Details` opens a first native
 Palm-style modal dialog; tapping its `OK` button closes it. Tapping `New`,
 sending text, and tapping `Done` prepends a new synthetic memo record for the
 current runtime.
